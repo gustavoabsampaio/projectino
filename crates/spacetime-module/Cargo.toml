@@ -1,0 +1,13 @@
+[package]
+name = "spacetime-module"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+log = { workspace = true }
+spacetimedb = { workspace = true }

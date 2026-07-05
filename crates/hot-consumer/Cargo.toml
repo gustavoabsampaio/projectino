@@ -1,0 +1,13 @@
+[package]
+name = "hot-consumer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+common = { workspace = true }
+rdkafka = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

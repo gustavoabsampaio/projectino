@@ -1,0 +1,5 @@
+# Bun is the only JS runtime/package manager for this project (no Node/npm).
+
+[install]
+# Always pin exact versions when adding dependencies.
+exact = true

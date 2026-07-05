@@ -1,0 +1,15 @@
+# Rust
+/target/
+
+# Frontend (Bun) — bun.lock IS committed, do not ignore it
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+
+# Environment (copy from .env.example)
+.env
+frontend/.env
+
+# OS / editor noise
+.DS_Store
+*.log

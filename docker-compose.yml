@@ -1,0 +1,93 @@
+# Infrastructure ONLY — the Rust services and the frontend run natively on the
+# host (`cargo run` / `bun run dev`) against the ports mapped here.
+# Do not add application services or Dockerfiles for the workspace crates;
+# containerizing them is a deliberate later deployment step.
+#
+# Image tags pinned on 2026-07-03 (newest stable at least two weeks old).
+name: projectino
+
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.10
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      # internal listener for other containers, external listener for the host
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr=internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr=internal://redpanda:8082,external://localhost:18082
+      - --schema-registry-addr=internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr=redpanda:33145
+      - --advertise-rpc-addr=redpanda:33145
+    ports:
+      - "19092:19092" # Kafka API (use localhost:19092 from the host)
+      - "18081:18081" # schema registry
+      - "18082:18082" # pandaproxy (HTTP)
+      - "9644:9644"   # admin API / metrics
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  console:
+    image: docker.redpanda.com/redpandadata/console:v3.7.4
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "8080:8080" # Redpanda Console UI → http://localhost:8080
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000" # S3 API
+      - "9001:9001" # MinIO console UI → http://localhost:9001
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # One-shot job: creates the lake bucket, then exits.
+  minio-init:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb --ignore-existing local/market-lake &&
+        echo "bucket market-lake ready"
+    restart: "no"
+
+  spacetimedb:
+    image: clockworklabs/spacetime:v2.6.0
+    command: start
+    ports:
+      - "3000:3000" # HTTP + websocket API
+    # NOTE: no volume mounted — database state is ephemeral across
+    # `docker compose down`. Fine for this skeleton; re-publish the module
+    # after a restart. TODO: mount a volume once the image's data path is
+    # confirmed for this version.
+
+volumes:
+  redpanda-data:
+  minio-data:
