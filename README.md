@@ -1,8 +1,13 @@
 # projectino
 
-Real-time crypto market data pipeline (portfolio project). **Skeleton stage:**
-every service compiles, connects to its dependencies, and logs — no business
-logic yet.
+Real-time crypto market data pipeline (portfolio project, built alongside an
+AI agent).
+
+**Status:** the **ingestor is implemented** — it streams live Binance market
+data (aggTrades, bookTickers, klines) over a combined websocket stream and
+produces enveloped JSON events to per-event-type Redpanda topics, keyed by
+symbol, with jittered-backoff reconnects and graceful shutdown. The consumers,
+API, and frontend are still connectivity skeletons.
 
 ## Architecture
 
@@ -42,7 +47,11 @@ The JS toolchain is **Bun only** — no Node.js, npm, or nvm anywhere.
 
 - Rust stable (`rustup`), plus the wasm target for the SpacetimeDB module:
   `rustup target add wasm32-unknown-unknown`
-- `cmake` + a C compiler (rdkafka builds librdkafka from source)
+- `cmake`, a C compiler, **and a C++ compiler** (rdkafka builds librdkafka
+  from source; CMake's toolchain detection needs a C++ compiler even though
+  librdkafka itself is C) — on Ubuntu, `build-essential` covers both
+- `libcurl` dev headers (librdkafka's build unconditionally includes
+  `curl/curl.h` regardless of build flags) — on Ubuntu, `libcurl4-openssl-dev`
 - Docker with the compose plugin
 - [Bun](https://bun.sh) ≥ 1.3
 - [SpacetimeDB CLI](https://spacetimedb.com/install) (`spacetime`) — for
@@ -56,17 +65,20 @@ cp .env.example .env
 cp frontend/.env.example frontend/.env
 docker compose up -d          # or: make infra-up
 
-# 2. rust services (each connects, logs "connected", and exits for now)
-cargo run -p ingestor
-cargo run -p hot-consumer
-cargo run -p cold-consumer
+# 2. create the market topics (6 partitions, explicit retention)
+make topics
+
+# 3. rust services
+cargo run -p ingestor         # streams Binance → Redpanda until Ctrl-C
+cargo run -p hot-consumer     # skeleton: connects, logs, exits
+cargo run -p cold-consumer    # skeleton: connects, logs, exits
 cargo run -p api              # stays up, serves GET /health on :8081
 
-# 3. spacetime module
+# 4. spacetime module
 spacetime publish --server http://localhost:3000 \
   --project-path crates/spacetime-module projectino   # or: make module-publish
 
-# 4. frontend (Bun only)
+# 5. frontend (Bun only)
 cd frontend
 bun install                   # first run: commit the generated bun.lock
 bun run dev                   # http://localhost:5173
@@ -77,6 +89,7 @@ bun run dev                   # http://localhost:5173
 | Check | How |
 |---|---|
 | Redpanda | `docker compose exec redpanda rpk cluster health` |
+| Live events flowing | `docker compose exec redpanda rpk topic consume market.trades --num 1` |
 | Redpanda Console | http://localhost:8080 |
 | MinIO + bucket | http://localhost:9001 (minioadmin/minioadmin), bucket `market-lake` |
 | SpacetimeDB | `curl http://localhost:3000/v1/database/projectino` (200 after publish) |
@@ -110,8 +123,6 @@ frontend/            React + TypeScript (Vite), managed with Bun
 
 ## Known TODOs (marked in code)
 
-- Verify Binance websocket field mappings and stream paths against current
-  docs (`crates/common/src/events.rs`, `.env.example`).
 - Generate SpacetimeDB client bindings (`make module-generate`) and replace
   the placeholder status checks with real connections (frontend service and
   hot-consumer).

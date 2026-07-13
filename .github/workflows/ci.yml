@@ -15,18 +15,22 @@ env:
 
 jobs:
   rust:
-    name: fmt / clippy / test
+    name: fmt / clippy / test (${{ matrix.toolchain }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # stable + the declared MSRV (rust-version in Cargo.toml)
+        toolchain: [stable, "1.96.1"]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: stable
+          toolchain: ${{ matrix.toolchain }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo clippy --workspace --locked --all-targets -- -D warnings
+      - run: cargo test --workspace --locked
 
   rust-supply-chain:
     name: cargo-deny / cargo-audit

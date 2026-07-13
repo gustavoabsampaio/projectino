@@ -13,7 +13,8 @@ pub fn load_dotenv() {
 
 /// Read a required environment variable, with a helpful error naming the key.
 pub fn required(key: &str) -> Result<String> {
-    std::env::var(key).with_context(|| format!("missing required env var `{key}` (see .env.example)"))
+    std::env::var(key)
+        .with_context(|| format!("missing required env var `{key}` (see .env.example)"))
 }
 
 /// Read an optional environment variable, falling back to `default`.

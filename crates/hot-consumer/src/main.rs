@@ -14,7 +14,7 @@ async fn main() -> Result<()> {
     common::config::init_tracing();
 
     let brokers = common::config::required("KAFKA_BROKERS")?;
-    let topic = common::config::optional("KAFKA_TOPIC", "market.events.raw");
+    let topic = common::config::optional("KAFKA_TOPIC", common::topics::TRADES);
     let group = common::config::optional("KAFKA_GROUP_HOT", "hot-consumer");
     let stdb_http = common::config::required("STDB_HTTP_URI")?;
 

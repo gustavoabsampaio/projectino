@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
     common::config::init_tracing();
 
     let brokers = common::config::required("KAFKA_BROKERS")?;
-    let topic = common::config::optional("KAFKA_TOPIC", "market.events.raw");
+    let topic = common::config::optional("KAFKA_TOPIC", common::topics::TRADES);
     let group = common::config::optional("KAFKA_GROUP_COLD", "cold-consumer");
     let minio_endpoint = common::config::required("MINIO_ENDPOINT")?;
     let minio_access_key = common::config::required("MINIO_ACCESS_KEY")?;

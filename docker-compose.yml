@@ -78,11 +78,11 @@ services:
         echo "bucket market-lake ready"
     restart: "no"
 
-  spacetimedb:
-    image: clockworklabs/spacetime:v2.6.0
-    command: start
-    ports:
-      - "3000:3000" # HTTP + websocket API
+  # spacetimedb:
+  #   image: clockworklabs/spacetime:v2.6.0
+  #   command: start
+  #   ports:
+  #     - "3000:3000" # HTTP + websocket API
     # NOTE: no volume mounted — database state is ephemeral across
     # `docker compose down`. Fine for this skeleton; re-publish the module
     # after a restart. TODO: mount a volume once the image's data path is

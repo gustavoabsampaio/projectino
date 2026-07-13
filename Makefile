@@ -3,7 +3,7 @@
 
 COMPOSE := docker compose
 
-.PHONY: help infra-up infra-down infra-logs topic-create build test lint fmt \
+.PHONY: help infra-up infra-down infra-logs topics build test lint fmt \
         run-ingestor run-hot run-cold run-api \
         frontend-install frontend-dev \
         module-publish module-generate
@@ -20,8 +20,12 @@ infra-down: ## stop infrastructure
 infra-logs: ## tail infrastructure logs
 	$(COMPOSE) logs -f
 
-topic-create: ## create the raw events topic (idempotent)
-	$(COMPOSE) exec redpanda rpk topic create market.events.raw --partitions 3 || true
+topics: ## create market topics with explicit configs (idempotent)
+	for t in market.trades market.book-tickers market.klines; do \
+		$(COMPOSE) exec redpanda rpk topic create $$t --partitions 6 \
+			--topic-config retention.ms=259200000 \
+			--topic-config cleanup.policy=delete || true; \
+	done
 
 build: ## build the Rust workspace and install frontend deps
 	cargo build --workspace

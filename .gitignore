@@ -13,3 +13,6 @@ frontend/.env
 # OS / editor noise
 .DS_Store
 *.log
+
+# Claude Settings
+.claude/
