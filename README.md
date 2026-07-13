@@ -96,6 +96,29 @@ bun run dev                   # http://localhost:5173
 | Axum API | `curl http://localhost:8081/health` → `{"status":"ok"}` |
 | Frontend | http://localhost:5173 — prints SpacetimeDB status on page & console |
 
+## Testing the ingestor
+
+Ingestor behavior (decode/route/envelope) is tested against **recorded fixtures**,
+not live Binance — fast, deterministic, and hermetic (no network, no running
+services). Fixtures are newline-delimited raw websocket frames replayed through
+the exact same handling path the live client uses.
+
+```sh
+make test-ingestor      # cargo test -p ingestor + replay every fixture; logs to logs/
+```
+
+Replay a single fixture with readable logs, or record a new one:
+
+```sh
+cargo run -p ingestor --bin replay -- crates/ingestor/tests/fixtures/normal-trading/stream.ndjson
+
+# record from live traffic, then trim into tests/fixtures/<scenario>/stream.ndjson
+INGESTOR_DUMP_RAW=out.ndjson cargo run -p ingestor
+```
+
+The hermetic replay assertions in `crates/ingestor/tests/replay.rs` run as part
+of `cargo test --workspace`, so CI gates every push on them.
+
 ## Ports
 
 | Service | Host port |
@@ -112,14 +135,28 @@ bun run dev                   # http://localhost:5173
 
 ```
 crates/
-  common/            shared types (Binance event models, symbols, config)
-  ingestor/          Binance websocket → Kafka producer
-  hot-consumer/      Kafka → SpacetimeDB reducer calls
-  cold-consumer/     Kafka → batched Parquet on MinIO
-  spacetime-module/  SpacetimeDB server module (wasm)
-  api/               Axum + DataFusion historical query API
-frontend/            React + TypeScript (Vite), managed with Bun
+  common/            shared types (Binance event models, symbols, config)   [implemented]
+  ingestor/          Binance websocket → Kafka producer                     [implemented]
+  hot-consumer/      Kafka → SpacetimeDB reducer calls                      [skeleton]
+  cold-consumer/     Kafka → batched Parquet on MinIO                       [skeleton]
+  spacetime-module/  SpacetimeDB server module (wasm)                       [skeleton]
+  api/               Axum + DataFusion historical query API                [skeleton]
+frontend/            React + TypeScript (Vite), managed with Bun            [skeleton]
 ```
+
+## CI
+
+CI is scoped to what's implemented (`.github/workflows/ci.yml`):
+
+- **rust** — `cargo fmt --check`, `cargo clippy -D warnings`, and
+  `cargo test` across the workspace (skeletons must still compile).
+- **supply-chain** — `cargo deny check` (advisories + licenses + bans +
+  sources). Deferred advisories, all from dependencies of the not-yet-built
+  `api`/`cold-consumer` skeletons, are listed with rationale in `deny.toml`.
+
+Deferred until the relevant part exists: the frontend job
+(`bun install --frozen-lockfile` + `bun audit`, needs a committed `bun.lock`),
+`cargo-audit`, and an MSRV toolchain leg. See the workflow footer.
 
 ## Known TODOs (marked in code)
 
@@ -127,5 +164,5 @@ frontend/            React + TypeScript (Vite), managed with Bun
   the placeholder status checks with real connections (frontend service and
   hot-consumer).
 - Cold-consumer Parquet writing, API lake queries, real module tables.
-- `bun.lock` must be committed after the first `bun install` (CI installs
-  with `--frozen-lockfile`).
+- Commit `bun.lock` (first `bun install`) and re-enable the frontend CI job.
+- Revisit the deferred `deny.toml` advisories as `api`/`cold-consumer` are built.

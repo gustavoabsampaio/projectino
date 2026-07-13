@@ -1,3 +1,7 @@
+# CI is scoped to what's implemented today (the `common` + `ingestor` crates,
+# with the other crates present as compiling skeletons). Jobs are added back as
+# the project grows — see "Deferred" at the bottom.
+#
 # All third-party actions are pinned to full commit SHAs (tag noted in the
 # comment). No job needs or receives secrets; top-level permissions are
 # read-only.
@@ -15,48 +19,40 @@ env:
 
 jobs:
   rust:
-    name: fmt / clippy / test (${{ matrix.toolchain }})
+    name: fmt / clippy / test
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        # stable + the declared MSRV (rust-version in Cargo.toml)
-        toolchain: [stable, "1.96.1"]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # rdkafka builds librdkafka from source; its build unconditionally needs
+      # the libcurl headers (and a C/C++ toolchain + cmake, preinstalled on the
+      # runner) even though we disable curl features.
+      - name: Install librdkafka build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: ${{ matrix.toolchain }}
+          toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --locked --all-targets -- -D warnings
       - run: cargo test --workspace --locked
 
-  rust-supply-chain:
-    name: cargo-deny / cargo-audit
+  supply-chain:
+    name: cargo-deny
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
-        with:
-          toolchain: stable
       - uses: taiki-e/install-action@c93ccc03e00cd0e08e494f5fd058a6c55a6a1907 # v2.82.8
         with:
-          tool: cargo-deny@0.19.9,cargo-audit@0.22.2
+          tool: cargo-deny@0.19.9
+      # Covers advisories + licenses + bans + sources against the RustSec DB.
+      # Deferred advisories are listed, with rationale, in deny.toml.
       - run: cargo deny check
-      - run: cargo audit
 
-  frontend:
-    name: bun install / audit
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: frontend
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: 1.3.14
-      # Requires bun.lock to be committed (run `bun install` locally once).
-      - run: bun install --frozen-lockfile
-      - run: bun audit
+# Deferred until the relevant part of the project exists:
+#   - frontend job (bun install --frozen-lockfile + bun audit): returns once
+#     the frontend is implemented and bun.lock is committed.
+#   - cargo-audit: cargo-deny's advisory check covers the same RustSec DB for
+#     now; re-add for defense-in-depth when the dependency tree stabilizes.
+#   - MSRV matrix (rust-version in Cargo.toml): re-add a "1.96.1" toolchain leg
+#     once the heavier crates (api/datafusion) are actually built and pinned.

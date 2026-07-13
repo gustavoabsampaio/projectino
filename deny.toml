@@ -5,6 +5,19 @@ all-features = false
 
 [advisories]
 yanked = "deny"
+# Deferred advisories, all from crates pulled in *only* by the not-yet-
+# implemented `api`/`cold-consumer` skeletons (datafusion / object_store).
+# None reach `common` or `ingestor`. Revisit each when the owning crate is
+# actually implemented — the fix may be a transitive bump by then. Reviewed
+# 2026-07-13.
+ignore = [
+    # `paste` is unmaintained (proc-macro, no runtime vuln). Via datafusion.
+    "RUSTSEC-2024-0436",
+    # quick-xml DoS (fixed in 0.41). Via object_store's S3/XML parsing; the
+    # cold path that would use it does not exist yet.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
 
 [licenses]
 # Workspace crates are publish = false; don't lint their license fields.
@@ -29,11 +42,17 @@ allow = [
     # spacetimedb is Business Source License 1.1 — free under its usage terms;
     # fine for a portfolio project. TODO: review before any commercial use.
     "BUSL-1.1",
+    # bzip2 compression codec (via parquet/datafusion in the api skeleton).
+    "bzip2-1.0.6",
 ]
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# The internal `common` crate is a path dependency (no version), which reads as
+# a wildcard; allow that for our own path deps without weakening the ban on
+# wildcard requirements against registry crates.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

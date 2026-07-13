@@ -4,7 +4,7 @@
 COMPOSE := docker compose
 
 .PHONY: help infra-up infra-down infra-logs topics build test lint fmt \
-        run-ingestor run-hot run-cold run-api \
+        test-ingestor run-ingestor run-hot run-cold run-api \
         frontend-install frontend-dev \
         module-publish module-generate
 
@@ -41,6 +41,9 @@ lint: ## fmt check + clippy + frontend typecheck
 
 fmt: ## format Rust code
 	cargo fmt --all
+
+test-ingestor: ## run ingestor tests + fixture replays (hermetic), log to logs/
+	./scripts/test-ingestor.sh
 
 run-ingestor: ## run the Binance → Kafka ingestor natively
 	cargo run -p ingestor
