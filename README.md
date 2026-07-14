@@ -74,9 +74,10 @@ cargo run -p hot-consumer     # skeleton: connects, logs, exits
 cargo run -p cold-consumer    # skeleton: connects, logs, exits
 cargo run -p api              # stays up, serves GET /health on :8081
 
-# 4. spacetime module
+# 4. spacetime module (SpacetimeDB runs as a compose service; state persists
+#    in a volume across `docker compose down` — use `down -v` to wipe)
 spacetime publish --server http://localhost:3000 \
-  --project-path crates/spacetime-module projectino   # or: make module-publish
+  --module-path crates/spacetime-module projectino    # or: make module-publish
 
 # 5. frontend (Bun only)
 cd frontend

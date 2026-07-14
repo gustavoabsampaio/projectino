@@ -6,7 +6,7 @@ COMPOSE := docker compose
 .PHONY: help infra-up infra-down infra-logs topics build test lint fmt \
         test-ingestor run-ingestor run-hot run-cold run-api \
         frontend-install frontend-dev \
-        module-publish module-generate
+        module-build module-publish module-republish module-generate
 
 help: ## list targets
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-18s %s\n", $$1, $$2}'
@@ -63,8 +63,14 @@ frontend-install: ## bun install (generates/updates bun.lock — commit it)
 frontend-dev: ## run the Vite dev server with Bun
 	cd frontend && bun run dev
 
+module-build: ## compile the SpacetimeDB module to wasm (no server needed)
+	spacetime build --module-path crates/spacetime-module
+
 module-publish: ## publish the SpacetimeDB module to the local server
-	spacetime publish --server http://localhost:3000 --project-path crates/spacetime-module projectino
+	spacetime publish --server http://localhost:3000 --module-path crates/spacetime-module projectino
+
+module-republish: ## republish after a breaking schema change (DESTROYS data)
+	spacetime publish --server http://localhost:3000 --module-path crates/spacetime-module --delete-data=on-conflict --yes projectino
 
 module-generate: ## generate TypeScript bindings for the frontend
-	spacetime generate --lang typescript --out-dir frontend/src/module_bindings --project-path crates/spacetime-module
+	spacetime generate --lang typescript --out-dir frontend/src/module_bindings --module-path crates/spacetime-module

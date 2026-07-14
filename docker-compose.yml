@@ -78,16 +78,29 @@ services:
         echo "bucket market-lake ready"
     restart: "no"
 
-  # spacetimedb:
-  #   image: clockworklabs/spacetime:v2.6.0
-  #   command: start
-  #   ports:
-  #     - "3000:3000" # HTTP + websocket API
-    # NOTE: no volume mounted — database state is ephemeral across
-    # `docker compose down`. Fine for this skeleton; re-publish the module
-    # after a restart. TODO: mount a volume once the image's data path is
-    # confirmed for this version.
+  spacetimedb:
+    image: clockworklabs/spacetime:v2.6.1
+    # The image runs as the non-root `spacetime` user (uid 1000), which can't
+    # write a root-owned named volume. Run as root for local dev so the volume
+    # is writable — consistent with the other dev infra containers here. A
+    # production setup would use a pre-owned volume and keep the non-root user.
+    user: "0:0"
+    # Explicit data-dir + named volume so state survives `docker compose down`
+    # (use `down -v` to wipe). Pinned to 2.6.1 to match the CLI and the
+    # `spacetimedb` crate in the workspace.
+    command: start --data-dir /var/lib/spacetimedb
+    ports:
+      - "3000:3000" # HTTP + websocket API → publish the module here
+    volumes:
+      - spacetimedb-data:/var/lib/spacetimedb
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000/v1/ping || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
 volumes:
   redpanda-data:
   minio-data:
+  spacetimedb-data:
