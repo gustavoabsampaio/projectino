@@ -1,6 +1,7 @@
-# CI is scoped to what's implemented today (the `common` + `ingestor` crates,
-# with the other crates present as compiling skeletons). Jobs are added back as
-# the project grows — see "Deferred" at the bottom.
+# CI is scoped to what's implemented today: the `common` + `ingestor` crates
+# (unit + hermetic replay tests), the `spacetime-module` wasm artifact, and the
+# docker-compose infra file. Other crates are present as compiling skeletons.
+# Jobs are added back as the project grows — see "Deferred" at the bottom.
 #
 # All third-party actions are pinned to full commit SHAs (tag noted in the
 # comment). No job needs or receives secrets; top-level permissions are
@@ -32,10 +33,16 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+          # for the spacetime-module wasm build step below
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --locked --all-targets -- -D warnings
       - run: cargo test --workspace --locked
+      # `cargo test` only host-compiles spacetime-module; verify its real
+      # deployable artifact (the wasm module) actually builds for its target.
+      - name: Build spacetime-module (wasm)
+        run: cargo build -p spacetime-module --target wasm32-unknown-unknown --locked
 
   supply-chain:
     name: cargo-deny
@@ -48,6 +55,15 @@ jobs:
       # Covers advisories + licenses + bans + sources against the RustSec DB.
       # Deferred advisories are listed, with rationale, in deny.toml.
       - run: cargo deny check
+
+  compose:
+    name: compose config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # Validates docker-compose.yml (schema, interpolation, service refs)
+      # without pulling images or starting containers — fast and hermetic.
+      - run: docker compose config --quiet
 
 # Deferred until the relevant part of the project exists:
 #   - frontend job (bun install --frozen-lockfile + bun audit): returns once
