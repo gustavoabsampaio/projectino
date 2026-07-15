@@ -6,7 +6,7 @@ COMPOSE := docker compose
 .PHONY: help infra-up infra-down infra-logs topics build test lint fmt \
         test-ingestor run-ingestor run-hot run-cold run-api \
         frontend-install frontend-dev \
-        module-build module-publish module-republish module-generate
+        module-build module-publish module-republish module-generate module-generate-rust
 
 help: ## list targets
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-18s %s\n", $$1, $$2}'
@@ -74,3 +74,7 @@ module-republish: ## republish after a breaking schema change (DESTROYS data)
 
 module-generate: ## generate TypeScript bindings for the frontend
 	spacetime generate --lang typescript --out-dir frontend/src/module_bindings --module-path crates/spacetime-module
+
+module-generate-rust: ## regenerate the hot-consumer's Rust bindings (then run `cargo fmt`)
+	spacetime generate --lang rust --out-dir crates/hot-consumer/src/module_bindings --module-path crates/spacetime-module
+	cargo fmt -p hot-consumer

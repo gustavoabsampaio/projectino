@@ -6,8 +6,12 @@ AI agent).
 **Status:** the **ingestor is implemented** — it streams live Binance market
 data (aggTrades, bookTickers, klines) over a combined websocket stream and
 produces enveloped JSON events to per-event-type Redpanda topics, keyed by
-symbol, with jittered-backoff reconnects and graceful shutdown. The consumers,
-API, and frontend are still connectivity skeletons.
+symbol, with jittered-backoff reconnects and graceful shutdown.
+
+The **hot path is also live**: the `hot-consumer` reads those topics and calls
+SpacetimeDB reducers to maintain live-state tables (latest trade / book ticker /
+candle per symbol) that the frontend will subscribe to. The cold path (Parquet
+lake), the historical API, and the frontend are still connectivity skeletons.
 
 ## Architecture
 
@@ -70,7 +74,7 @@ make topics
 
 # 3. rust services
 cargo run -p ingestor         # streams Binance → Redpanda until Ctrl-C
-cargo run -p hot-consumer     # skeleton: connects, logs, exits
+cargo run -p hot-consumer     # market.* topics → SpacetimeDB reducers (needs module published)
 cargo run -p cold-consumer    # skeleton: connects, logs, exits
 cargo run -p api              # stays up, serves GET /health on :8081
 
@@ -94,6 +98,7 @@ bun run dev                   # http://localhost:5173
 | Redpanda Console | http://localhost:8080 |
 | MinIO + bucket | http://localhost:9001 (minioadmin/minioadmin), bucket `market-lake` |
 | SpacetimeDB | `curl http://localhost:3000/v1/database/projectino` (200 after publish) |
+| Live state (hot path) | run `hot-consumer`, then `spacetime sql --server http://localhost:3000 projectino "SELECT symbol, price FROM live_trade"` |
 | Axum API | `curl http://localhost:8081/health` → `{"status":"ok"}` |
 | Frontend | http://localhost:5173 — prints SpacetimeDB status on page & console |
 
@@ -138,7 +143,7 @@ of `cargo test --workspace`, so CI gates every push on them.
 crates/
   common/            shared types (Binance event models, symbols, config)   [implemented]
   ingestor/          Binance websocket → Kafka producer                     [implemented]
-  hot-consumer/      Kafka → SpacetimeDB reducer calls                      [skeleton]
+  hot-consumer/      Kafka → SpacetimeDB reducer calls                      [implemented]
   cold-consumer/     Kafka → batched Parquet on MinIO                       [skeleton]
   spacetime-module/  SpacetimeDB server module (wasm)                       [skeleton]
   api/               Axum + DataFusion historical query API                [skeleton]
@@ -150,10 +155,15 @@ frontend/            React + TypeScript (Vite), managed with Bun            [ske
 CI is scoped to what's implemented (`.github/workflows/ci.yml`):
 
 - **rust** — `cargo fmt --check`, `cargo clippy -D warnings`, and
-  `cargo test` across the workspace (skeletons must still compile).
+  `cargo test` across the workspace (skeletons must still compile), plus a
+  `wasm32-unknown-unknown` build of `spacetime-module` — `cargo test` only
+  host-compiles it, so this verifies its real deployable artifact.
 - **supply-chain** — `cargo deny check` (advisories + licenses + bans +
   sources). Deferred advisories, all from dependencies of the not-yet-built
   `api`/`cold-consumer` skeletons, are listed with rationale in `deny.toml`.
+- **compose** — `docker compose config` validates `docker-compose.yml`
+  (schema/interpolation/service refs) without pulling images or starting
+  containers.
 
 Deferred until the relevant part exists: the frontend job
 (`bun install --frozen-lockfile` + `bun audit`, needs a committed `bun.lock`),
@@ -161,9 +171,25 @@ Deferred until the relevant part exists: the frontend job
 
 ## Known TODOs (marked in code)
 
-- Generate SpacetimeDB client bindings (`make module-generate`) and replace
-  the placeholder status checks with real connections (frontend service and
-  hot-consumer).
-- Cold-consumer Parquet writing, API lake queries, real module tables.
+- Generate SpacetimeDB TypeScript bindings (`make module-generate`) and replace
+  the frontend's placeholder status check with a real live subscription. (The
+  hot-consumer's Rust bindings are done via `make module-generate-rust`.)
+- Hot-consumer delivery: currently commit-after-enqueue with fire-and-forget
+  reducer calls (safe for self-healing live-state upserts). A stricter
+  commit-after-apply via the SDK `_then` callbacks, batched, is a follow-up.
+- Cold-consumer Parquet writing, API lake queries.
 - Commit `bun.lock` (first `bun install`) and re-enable the frontend CI job.
 - Revisit the deferred `deny.toml` advisories as `api`/`cold-consumer` are built.
+- Performance metrics: the replay `Stats` and the ingestor currently track only
+  correctness counters (events, decode errors) — add throughput (frames/s,
+  events/s) and latency (decode time, Kafka produce time) instrumentation, plus
+  consumer lag / reconnect counts as structured `tracing` fields that can later
+  back a metrics exporter.
+- Ingestor throughput scaling: the read loop awaits each Kafka produce inline
+  (`publish().await` in `ingestor::lib`), which caps throughput at ~1/ack-latency
+  and limits librdkafka batching — fine at current scale, a bottleneck as streams
+  grow (bookTicker dominates). When the metrics above show the ceiling: (1)
+  decouple produce from read via a *bounded* mpsc channel or `FuturesUnordered`
+  (keep bounded for backpressure), then (2) shard into multiple websocket
+  connections partitioned by symbol group. Any parallelism must preserve
+  per-symbol ordering (messages are keyed by symbol).

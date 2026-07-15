@@ -1,7 +1,8 @@
-# CI is scoped to what's implemented today: the `common` + `ingestor` crates
-# (unit + hermetic replay tests), the `spacetime-module` wasm artifact, and the
-# docker-compose infra file. Other crates are present as compiling skeletons.
-# Jobs are added back as the project grows — see "Deferred" at the bottom.
+# CI is scoped to what's implemented today: the `common`, `ingestor`, and
+# `hot-consumer` crates (unit + hermetic replay/decode tests), the
+# `spacetime-module` wasm artifact, and the docker-compose infra file. Other
+# crates are present as compiling skeletons. Jobs are added back as the project
+# grows — see "Deferred" at the bottom.
 #
 # All third-party actions are pinned to full commit SHAs (tag noted in the
 # comment). No job needs or receives secrets; top-level permissions are

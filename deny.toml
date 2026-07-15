@@ -46,6 +46,44 @@ allow = [
     "bzip2-1.0.6",
 ]
 
+# These SpacetimeDB client-SDK crates (pulled in via `spacetimedb-sdk`) ship a
+# Business Source License 1.1 LICENSE file but declare `license = "non-standard"`,
+# so cargo-deny's text matcher mis-identifies the BSL text as AGPL-3.0. Every
+# LICENSE header reads "SPACETIMEDB BUSINESS SOURCE LICENSE AGREEMENT / Business
+# Source License 1.1" (verified 2026-07-14, all byte-identical) — the same
+# BUSL-1.1 as the main `spacetimedb` crate we already allow. The precise fix
+# ([[licenses.clarify]] → BUSL-1.1) requires a file hash cargo-deny won't
+# surface, so we scope a per-crate exception for the (mis-detected) AGPL license
+# instead: AGPL-3.0 stays banned everywhere else, so a *genuine* AGPL dependency
+# would still fail the build.
+[[licenses.exceptions]]
+crate = "spacetimedb-data-structures"
+allow = ["AGPL-3.0-or-later"]
+
+[[licenses.exceptions]]
+crate = "spacetimedb-client-api-messages"
+allow = ["AGPL-3.0-or-later"]
+
+[[licenses.exceptions]]
+crate = "spacetimedb-memory-usage"
+allow = ["AGPL-3.0-or-later"]
+
+[[licenses.exceptions]]
+crate = "spacetimedb-metrics"
+allow = ["AGPL-3.0-or-later"]
+
+[[licenses.exceptions]]
+crate = "spacetimedb-schema"
+allow = ["AGPL-3.0-or-later"]
+
+[[licenses.exceptions]]
+crate = "spacetimedb-sdk"
+allow = ["AGPL-3.0-or-later"]
+
+[[licenses.exceptions]]
+crate = "spacetimedb-sql-parser"
+allow = ["AGPL-3.0-or-later"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
