@@ -8,10 +8,11 @@ data (aggTrades, bookTickers, klines) over a combined websocket stream and
 produces enveloped JSON events to per-event-type Redpanda topics, keyed by
 symbol, with jittered-backoff reconnects and graceful shutdown.
 
-The **hot path is also live**: the `hot-consumer` reads those topics and calls
-SpacetimeDB reducers to maintain live-state tables (latest trade / book ticker /
-candle per symbol) that the frontend will subscribe to. The cold path (Parquet
-lake), the historical API, and the frontend are still connectivity skeletons.
+The **hot path is complete, end to end**: the `hot-consumer` reads those topics
+and calls SpacetimeDB reducers to maintain live-state tables (latest trade /
+book ticker / candle per symbol), and the **React frontend subscribes to them
+live** via the SpacetimeDB TS SDK — Binance ticks show up in the browser in real
+time. The cold path (Parquet lake) and the historical API are still skeletons.
 
 ## Architecture
 
@@ -83,9 +84,9 @@ cargo run -p api              # stays up, serves GET /health on :8081
 spacetime publish --server http://localhost:3000 \
   --module-path crates/spacetime-module projectino    # or: make module-publish
 
-# 5. frontend (Bun only)
+# 5. frontend (Bun only) — live view of the SpacetimeDB tables
 cd frontend
-bun install                   # first run: commit the generated bun.lock
+bun install                   # reproducible from the committed bun.lock
 bun run dev                   # http://localhost:5173
 ```
 
@@ -147,7 +148,7 @@ crates/
   cold-consumer/     Kafka → batched Parquet on MinIO                       [skeleton]
   spacetime-module/  SpacetimeDB server module (wasm)                       [skeleton]
   api/               Axum + DataFusion historical query API                [skeleton]
-frontend/            React + TypeScript (Vite), managed with Bun            [skeleton]
+frontend/            React + TypeScript (Vite), managed with Bun            [implemented]
 ```
 
 ## CI
@@ -164,21 +165,21 @@ CI is scoped to what's implemented (`.github/workflows/ci.yml`):
 - **compose** — `docker compose config` validates `docker-compose.yml`
   (schema/interpolation/service refs) without pulling images or starting
   containers.
+- **frontend** — `bun install --frozen-lockfile`, `bun run typecheck` (against
+  the generated SDK bindings), and `bun audit`. Bun only, no Node/npm.
 
-Deferred until the relevant part exists: the frontend job
-(`bun install --frozen-lockfile` + `bun audit`, needs a committed `bun.lock`),
-`cargo-audit`, and an MSRV toolchain leg. See the workflow footer.
+Deferred until the relevant part exists: `cargo-audit` and an MSRV toolchain
+leg. See the workflow footer.
 
 ## Known TODOs (marked in code)
 
-- Generate SpacetimeDB TypeScript bindings (`make module-generate`) and replace
-  the frontend's placeholder status check with a real live subscription. (The
-  hot-consumer's Rust bindings are done via `make module-generate-rust`.)
 - Hot-consumer delivery: currently commit-after-enqueue with fire-and-forget
   reducer calls (safe for self-healing live-state upserts). A stricter
   commit-after-apply via the SDK `_then` callbacks, batched, is a follow-up.
 - Cold-consumer Parquet writing, API lake queries.
-- Commit `bun.lock` (first `bun install`) and re-enable the frontend CI job.
+- Frontend: display is minimal (live tables); historical charts come once the
+  Axum API exists. Regenerate SDK bindings with `make module-generate` after
+  module schema changes.
 - Revisit the deferred `deny.toml` advisories as `api`/`cold-consumer` are built.
 - Performance metrics: the replay `Stats` and the ingestor currently track only
   correctness counters (events, decode errors) — add throughput (frames/s,

@@ -1,0 +1,70 @@
+:root {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color-scheme: light dark;
+  --border: color-mix(in srgb, currentColor 18%, transparent);
+  --muted: color-mix(in srgb, currentColor 55%, transparent);
+}
+
+body {
+  margin: 0;
+}
+
+.app {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem 4rem;
+  line-height: 1.4;
+}
+
+.app h1 {
+  font-size: 1.4rem;
+  margin: 0 0 0.25rem;
+}
+
+.app header p {
+  color: var(--muted);
+  margin: 0 0 1.5rem;
+}
+
+.app h2 {
+  font-size: 1rem;
+  margin: 1.75rem 0 0.5rem;
+}
+
+.app .ok {
+  color: #16a34a;
+  font-weight: bold;
+}
+
+.app .wait {
+  color: #d97706;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 0.35rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+}
+
+th {
+  color: var(--muted);
+  font-weight: normal;
+}
+
+td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+td.empty {
+  color: var(--muted);
+  text-align: center;
+  padding: 1rem;
+}
