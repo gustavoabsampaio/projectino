@@ -22,7 +22,7 @@ use datafusion::prelude::*;
 use object_store::aws::AmazonS3Builder;
 use serde::Deserialize;
 use tower_http::cors::CorsLayer;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::config::Config;
@@ -36,7 +36,23 @@ const KLINES: &str = "klines";
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
 
-type AppState = Arc<SessionContext>;
+/// The lake tables: (DataFusion table name, Kafka topic / lake prefix).
+fn lake_tables() -> [(&'static str, &'static str); 3] {
+    [
+        (TRADES, topics::TRADES),
+        (BOOK_TICKERS, topics::BOOK_TICKERS),
+        (KLINES, topics::KLINES),
+    ]
+}
+
+/// Handler state: the DataFusion context plus the config needed to refresh
+/// table registrations.
+struct AppState {
+    ctx: SessionContext,
+    cfg: Config,
+}
+
+type SharedState = Arc<AppState>;
 
 pub async fn run(cfg: Config) -> Result<()> {
     let ctx = build_context(&cfg).await?;
@@ -57,7 +73,10 @@ pub async fn run(cfg: Config) -> Result<()> {
         .route("/book_tickers", get(book_tickers))
         .route("/klines", get(klines))
         .layer(cors)
-        .with_state(Arc::new(ctx));
+        .with_state(Arc::new(AppState {
+            ctx,
+            cfg: cfg.clone(),
+        }));
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen_addr)
         .await
@@ -86,28 +105,49 @@ async fn build_context(cfg: &Config) -> Result<SessionContext> {
     let url = Url::parse(&base).with_context(|| format!("parsing object-store URL {base}"))?;
     ctx.register_object_store(&url, Arc::new(store));
 
-    // One Parquet table per topic. Schema is inferred from existing files, so a
-    // table with no data yet is skipped (re-run after the cold-consumer writes).
-    register_table(&ctx, TRADES, topics::TRADES, cfg).await;
-    register_table(&ctx, BOOK_TICKERS, topics::BOOK_TICKERS, cfg).await;
-    register_table(&ctx, KLINES, topics::KLINES, cfg).await;
+    // One Parquet table per topic. A table with no data yet simply fails to
+    // register here; queries refresh the registration anyway (see below).
+    for (name, topic) in lake_tables() {
+        match register_table(&ctx, name, topic, cfg).await {
+            Ok(()) => info!(table = name, "registered lake table"),
+            Err(error) => warn!(
+                table = name,
+                error = %error,
+                "table not registered yet — no data in the lake? it will register on first query once the cold-consumer writes"
+            ),
+        }
+    }
     Ok(ctx)
 }
 
-async fn register_table(ctx: &SessionContext, name: &str, topic: &str, cfg: &Config) {
+/// (Re)register a Parquet table over its lake prefix.
+///
+/// DataFusion resolves the set of files when the table is registered, so a
+/// long-running api would never see Parquet written after startup. Re-running
+/// this refreshes that listing.
+async fn register_table(ctx: &SessionContext, name: &str, topic: &str, cfg: &Config) -> Result<()> {
     let path = format!("s3://{}/{}/", cfg.bucket, topic);
-    match ctx
-        .register_parquet(name, &path, ParquetReadOptions::default())
+    // `register_parquet` errors with "table already exists" rather than
+    // replacing, so drop the previous registration first (no-op on first call).
+    let _ = ctx.deregister_table(name);
+    ctx.register_parquet(name, &path, ParquetReadOptions::default())
         .await
-    {
-        Ok(()) => info!(table = name, path, "registered lake table"),
-        Err(error) => warn!(
-            table = name,
-            path,
-            error = %error,
-            "table not registered — no data in the lake yet? run the cold-consumer, then restart the api"
-        ),
+        .with_context(|| format!("registering {name} from {path}"))
+}
+
+/// Refresh the table registration so newly written Parquet is visible, then
+/// return a DataFrame over it.
+///
+/// This re-lists the lake prefix on every request — the simple, always-fresh
+/// choice at this scale. If the lake grows large, cache the listing behind a
+/// short TTL instead.
+async fn fresh_table(state: &AppState, name: &str, topic: &str) -> Result<DataFrame, AppError> {
+    if let Err(error) = register_table(&state.ctx, name, topic, &state.cfg).await {
+        // Don't fail a table that is already registered just because a refresh
+        // hiccuped; fall through to whatever registration we have.
+        debug!(table = name, error = %format!("{error:#}"), "table refresh failed");
     }
+    Ok(state.ctx.table(name).await?)
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -134,30 +174,33 @@ fn with_symbol(df: DataFrame, symbol: &Option<String>) -> Result<DataFrame, AppE
 }
 
 async fn trades(
-    State(ctx): State<AppState>,
+    State(state): State<SharedState>,
     Query(p): Query<Params>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let df = with_symbol(ctx.table(TRADES).await?, &p.symbol)?
+    let table = fresh_table(&state, TRADES, topics::TRADES).await?;
+    let df = with_symbol(table, &p.symbol)?
         .sort(vec![col("trade_time").sort(false, false)])?
         .limit(0, Some(clamp_limit(p.limit)))?;
     Ok(Json(batches_to_json(&df.collect().await?)?))
 }
 
 async fn book_tickers(
-    State(ctx): State<AppState>,
+    State(state): State<SharedState>,
     Query(p): Query<Params>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let df = with_symbol(ctx.table(BOOK_TICKERS).await?, &p.symbol)?
+    let table = fresh_table(&state, BOOK_TICKERS, topics::BOOK_TICKERS).await?;
+    let df = with_symbol(table, &p.symbol)?
         .sort(vec![col("update_id").sort(false, false)])?
         .limit(0, Some(clamp_limit(p.limit)))?;
     Ok(Json(batches_to_json(&df.collect().await?)?))
 }
 
 async fn klines(
-    State(ctx): State<AppState>,
+    State(state): State<SharedState>,
     Query(p): Query<Params>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let mut df = with_symbol(ctx.table(KLINES).await?, &p.symbol)?;
+    let table = fresh_table(&state, KLINES, topics::KLINES).await?;
+    let mut df = with_symbol(table, &p.symbol)?;
     if let Some(interval) = &p.interval {
         df = df.filter(col("interval").eq(lit(interval.as_str())))?;
     }

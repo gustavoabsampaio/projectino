@@ -193,9 +193,12 @@ leg. See the workflow footer.
   add axes/tooltips/zoom, and a trades-history view, as needed. Candle dedup
   happens client-side because the lake is append-only (one row per kline
   *update*) — an api-side "latest per open_time" aggregation would be cheaper.
-- API refinements: pagination / time-range filters; a `Decimal128` lake schema
-  so price aggregations don't need a cast; lazy table (re)registration so a
-  restart isn't needed when the first data lands.
+- API refinements: pagination / time-range filters, and a `Decimal128` lake
+  schema so price aggregations don't need a cast.
+- API listing cost: DataFusion resolves the lake file list at table
+  registration, so the api re-registers each table per request to stay fresh.
+  That re-lists the prefix on every call — fine now, but cache it behind a
+  short TTL once the lake grows.
 - Regenerate SDK bindings with `make module-generate` after module schema
   changes.
 - Revisit the deferred `deny.toml` advisories as `api`/`cold-consumer` are built.
