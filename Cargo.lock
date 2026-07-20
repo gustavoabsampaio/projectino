@@ -751,9 +751,14 @@ name = "cold-consumer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow",
  "common",
  "object_store",
+ "parquet",
  "rdkafka",
+ "rust_decimal",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]
