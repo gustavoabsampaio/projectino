@@ -200,10 +200,19 @@ leg. See the workflow footer.
   per interval.
 - API refinements: pagination / time-range filters, and a `Decimal128` lake
   schema so price aggregations don't need a cast.
-- API listing cost: DataFusion resolves the lake file list at table
-  registration, so the api re-registers each table per request to stay fresh.
-  That re-lists the prefix on every call — fine now, but cache it behind a
-  short TTL once the lake grows.
+- **BROKEN: the `1s` chart interval never loads.** Root cause measured
+  2026-07-20: `/klines` takes ~5–7s per request because the api re-lists the
+  whole lake prefix (1,611 Parquet files) on every call to stay fresh, while
+  the 1s chart polls every 1s. Each response is superseded by a newer request
+  before it lands, and the frontend's stale-response guard correctly discards
+  it — so nothing ever renders. Every other interval works (their poll periods
+  exceed the response time). Two fixes, either of which unblocks it:
+  1. Cache the DataFusion table listing behind a short TTL (say 2–5s) instead
+     of re-registering per request — this is the real fix and also removes the
+     per-request listing cost as the lake grows.
+  2. Skip a poll while one is still in flight (and/or back the poll period off
+     to the observed latency), so a slow api degrades to slower refreshes
+     rather than none.
 - Regenerate SDK bindings with `make module-generate` after module schema
   changes.
 - Revisit the deferred `deny.toml` advisories as `api`/`cold-consumer` are built.
