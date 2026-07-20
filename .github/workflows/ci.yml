@@ -1,7 +1,6 @@
-# CI is scoped to what's implemented today: the `common`, `ingestor`, and
-# `hot-consumer` crates (unit + hermetic replay/decode tests), the
-# `spacetime-module` wasm artifact, the `frontend` (typecheck + audit), and the
-# docker-compose infra file. Other crates are present as compiling skeletons.
+# CI covers the whole workspace (common, ingestor, hot-consumer, cold-consumer,
+# api, spacetime-module) with unit + hermetic tests, the spacetime-module wasm
+# artifact, the frontend (typecheck + audit), and the docker-compose infra file.
 # Jobs are added back as the project grows — see "Deferred" at the bottom.
 #
 # All third-party actions are pinned to full commit SHAs (tag noted in the

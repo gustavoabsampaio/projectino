@@ -89,12 +89,16 @@ name = "api"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow",
  "axum",
  "common",
  "datafusion",
+ "object_store",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

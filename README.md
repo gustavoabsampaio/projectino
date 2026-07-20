@@ -14,10 +14,12 @@ book ticker / candle per symbol), and the **React frontend subscribes to them
 live** via the SpacetimeDB TS SDK — Binance ticks show up in the browser in real
 time.
 
-The **cold-path writer is also implemented**: the `cold-consumer` batches events
-into Arrow and writes partitioned Parquet files to the MinIO lake (deterministic,
-idempotent filenames; offsets committed only after upload). The historical API
-(`api`, DataFusion over the lake) is the remaining skeleton.
+The **cold path is complete too**: the `cold-consumer` batches events into Arrow
+and writes partitioned Parquet to the MinIO lake (deterministic, idempotent
+filenames; offsets committed only after upload), and the `api` crate serves
+historical queries over that lake with **DataFusion** — registering the Parquet
+as tables and answering typed REST endpoints (`/trades`, `/book_tickers`,
+`/klines`). All that remains is wiring history charts into the frontend.
 
 ## Architecture
 
@@ -82,7 +84,7 @@ make topics
 cargo run -p ingestor         # streams Binance → Redpanda until Ctrl-C
 cargo run -p hot-consumer     # market.* topics → SpacetimeDB reducers (needs module published)
 cargo run -p cold-consumer    # market.* topics → batched Parquet on MinIO
-cargo run -p api              # stays up, serves GET /health on :8081
+cargo run -p api              # DataFusion over the lake; REST on :8081
 
 # 4. spacetime module (SpacetimeDB runs as a compose service; state persists
 #    in a volume across `docker compose down` — use `down -v` to wipe)
@@ -106,7 +108,8 @@ bun run dev                   # http://localhost:5173
 | SpacetimeDB | `curl http://localhost:3000/v1/database/projectino` (200 after publish) |
 | Live state (hot path) | run `hot-consumer`, then `spacetime sql --server http://localhost:3000 projectino "SELECT symbol, price FROM live_trade"` |
 | Lake files (cold path) | run `cold-consumer`, then browse http://localhost:9001 → bucket `market-lake` (Parquet under `market.trades/partition=…/`) |
-| Axum API | `curl http://localhost:8081/health` → `{"status":"ok"}` |
+| Axum API (health) | `curl http://localhost:8081/health` → `{"status":"ok"}` |
+| History query (cold path) | `curl "http://localhost:8081/trades?symbol=BTCUSDT&limit=5"` (also `/book_tickers`, `/klines?symbol=…&interval=1m`) |
 | Frontend | http://localhost:5173 — prints SpacetimeDB status on page & console |
 
 ## Testing the ingestor
@@ -153,7 +156,7 @@ crates/
   hot-consumer/      Kafka → SpacetimeDB reducer calls                      [implemented]
   cold-consumer/     Kafka → batched Parquet on MinIO                       [implemented]
   spacetime-module/  SpacetimeDB server module (wasm)                       [skeleton]
-  api/               Axum + DataFusion historical query API                [skeleton]
+  api/               Axum + DataFusion historical query API                [implemented]
 frontend/            React + TypeScript (Vite), managed with Bun            [implemented]
 ```
 
@@ -182,11 +185,14 @@ leg. See the workflow footer.
 - Hot-consumer delivery: currently commit-after-enqueue with fire-and-forget
   reducer calls (safe for self-healing live-state upserts). A stricter
   commit-after-apply via the SDK `_then` callbacks, batched, is a follow-up.
-- API: register the MinIO lake in DataFusion and serve historical queries over
-  the Parquet the cold-consumer writes.
-- Frontend: display is minimal (live tables); historical charts come once the
-  Axum API exists. Regenerate SDK bindings with `make module-generate` after
-  module schema changes.
+- Frontend history: wire charts fed by the `api` endpoints (`/trades`,
+  `/klines`, …) alongside the live tables. The api will need CORS for the
+  browser origin, and prices are strings (cast in queries as needed).
+- API refinements: pagination / time-range filters; a `Decimal128` lake schema
+  so price aggregations don't need a cast; lazy table (re)registration so a
+  restart isn't needed when the first data lands.
+- Regenerate SDK bindings with `make module-generate` after module schema
+  changes.
 - Revisit the deferred `deny.toml` advisories as `api`/`cold-consumer` are built.
 - Performance metrics: the replay `Stats` and the ingestor currently track only
   correctness counters (events, decode errors) — add throughput (frames/s,
