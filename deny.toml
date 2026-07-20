@@ -5,16 +5,17 @@ all-features = false
 
 [advisories]
 yanked = "deny"
-# Deferred advisories, all from crates pulled in *only* by the not-yet-
-# implemented `api`/`cold-consumer` skeletons (datafusion / object_store).
-# None reach `common` or `ingestor`. Revisit each when the owning crate is
-# actually implemented — the fix may be a transitive bump by then. Reviewed
-# 2026-07-13.
+# Deferred advisories. None reach `common`/`ingestor`/`hot-consumer`. Revisit
+# on the next dependency bump — the fixes may arrive transitively. Reviewed
+# 2026-07-20.
 ignore = [
-    # `paste` is unmaintained (proc-macro, no runtime vuln). Via datafusion.
+    # `paste` is unmaintained (proc-macro, no runtime vuln). Via datafusion,
+    # which is only pulled in by the not-yet-implemented `api` skeleton.
     "RUSTSEC-2024-0436",
-    # quick-xml DoS (fixed in 0.41). Via object_store's S3/XML parsing; the
-    # cold path that would use it does not exist yet.
+    # quick-xml DoS (fixed in 0.41), via object_store's S3 XML parsing. Now
+    # reachable through the implemented cold-consumer, but only against our own
+    # local MinIO responses (not attacker-controlled), so low risk. Bump when
+    # object_store ships a quick-xml >= 0.41.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
 ]

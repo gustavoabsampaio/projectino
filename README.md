@@ -12,7 +12,12 @@ The **hot path is complete, end to end**: the `hot-consumer` reads those topics
 and calls SpacetimeDB reducers to maintain live-state tables (latest trade /
 book ticker / candle per symbol), and the **React frontend subscribes to them
 live** via the SpacetimeDB TS SDK — Binance ticks show up in the browser in real
-time. The cold path (Parquet lake) and the historical API are still skeletons.
+time.
+
+The **cold-path writer is also implemented**: the `cold-consumer` batches events
+into Arrow and writes partitioned Parquet files to the MinIO lake (deterministic,
+idempotent filenames; offsets committed only after upload). The historical API
+(`api`, DataFusion over the lake) is the remaining skeleton.
 
 ## Architecture
 
@@ -76,7 +81,7 @@ make topics
 # 3. rust services
 cargo run -p ingestor         # streams Binance → Redpanda until Ctrl-C
 cargo run -p hot-consumer     # market.* topics → SpacetimeDB reducers (needs module published)
-cargo run -p cold-consumer    # skeleton: connects, logs, exits
+cargo run -p cold-consumer    # market.* topics → batched Parquet on MinIO
 cargo run -p api              # stays up, serves GET /health on :8081
 
 # 4. spacetime module (SpacetimeDB runs as a compose service; state persists
@@ -100,6 +105,7 @@ bun run dev                   # http://localhost:5173
 | MinIO + bucket | http://localhost:9001 (minioadmin/minioadmin), bucket `market-lake` |
 | SpacetimeDB | `curl http://localhost:3000/v1/database/projectino` (200 after publish) |
 | Live state (hot path) | run `hot-consumer`, then `spacetime sql --server http://localhost:3000 projectino "SELECT symbol, price FROM live_trade"` |
+| Lake files (cold path) | run `cold-consumer`, then browse http://localhost:9001 → bucket `market-lake` (Parquet under `market.trades/partition=…/`) |
 | Axum API | `curl http://localhost:8081/health` → `{"status":"ok"}` |
 | Frontend | http://localhost:5173 — prints SpacetimeDB status on page & console |
 
@@ -145,7 +151,7 @@ crates/
   common/            shared types (Binance event models, symbols, config)   [implemented]
   ingestor/          Binance websocket → Kafka producer                     [implemented]
   hot-consumer/      Kafka → SpacetimeDB reducer calls                      [implemented]
-  cold-consumer/     Kafka → batched Parquet on MinIO                       [skeleton]
+  cold-consumer/     Kafka → batched Parquet on MinIO                       [implemented]
   spacetime-module/  SpacetimeDB server module (wasm)                       [skeleton]
   api/               Axum + DataFusion historical query API                [skeleton]
 frontend/            React + TypeScript (Vite), managed with Bun            [implemented]
@@ -160,8 +166,8 @@ CI is scoped to what's implemented (`.github/workflows/ci.yml`):
   `wasm32-unknown-unknown` build of `spacetime-module` — `cargo test` only
   host-compiles it, so this verifies its real deployable artifact.
 - **supply-chain** — `cargo deny check` (advisories + licenses + bans +
-  sources). Deferred advisories, all from dependencies of the not-yet-built
-  `api`/`cold-consumer` skeletons, are listed with rationale in `deny.toml`.
+  sources). Deferred advisories (from `datafusion` in the `api` skeleton, and
+  `object_store`'s S3 XML parsing) are listed with rationale in `deny.toml`.
 - **compose** — `docker compose config` validates `docker-compose.yml`
   (schema/interpolation/service refs) without pulling images or starting
   containers.
@@ -176,7 +182,8 @@ leg. See the workflow footer.
 - Hot-consumer delivery: currently commit-after-enqueue with fire-and-forget
   reducer calls (safe for self-healing live-state upserts). A stricter
   commit-after-apply via the SDK `_then` callbacks, batched, is a follow-up.
-- Cold-consumer Parquet writing, API lake queries.
+- API: register the MinIO lake in DataFusion and serve historical queries over
+  the Parquet the cold-consumer writes.
 - Frontend: display is minimal (live tables); historical charts come once the
   Axum API exists. Regenerate SDK bindings with `make module-generate` after
   module schema changes.
