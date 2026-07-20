@@ -1,13 +1,11 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useSpacetimeDB, useTable } from 'spacetimedb/react';
 import { tables } from './module_bindings';
 import CandleChart from './components/CandleChart';
 import { fetchCandles, type KlineRow } from './lib/api';
+import { INTERVALS, refreshLabel, refreshPeriodMs } from './lib/intervals';
 
 const SYMBOLS = ['BTCUSDT', 'ETHUSDT'];
-// Must match what the ingestor recorded (KLINE_INTERVAL); 1s fills a chart fast,
-// 1m needs minutes of history to accumulate distinct candles.
-const INTERVALS = ['1s', '1m'];
 
 /** Sort a copy of the rows by symbol for stable rendering. */
 function bySymbol<T extends { symbol: string }>(rows: readonly T[]): T[] {
@@ -116,19 +114,32 @@ function History() {
   const [state, setState] = useState<'loading' | 'ready' | 'error'>('loading');
   const [error, setError] = useState('');
 
-  const load = useCallback(async (sym: string, interval: string) => {
-    setState('loading');
+  const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
+  // Skip the "loading" flash on background polls — only the first load and
+  // explicit refreshes should blank the chart.
+  const loadedOnce = useRef(false);
+
+  const load = useCallback(async (sym: string, interval: string, quiet = false) => {
+    if (!quiet || !loadedOnce.current) setState('loading');
     try {
       setCandles(await fetchCandles(sym, interval));
       setState('ready');
+      setUpdatedAt(new Date());
+      loadedOnce.current = true;
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setState('error');
     }
   }, []);
 
+  // Reload on selection change, then poll at the candle's own cadence:
+  // 1s → every 1s, 1h → every 1h, capped at 24h (setInterval's 32-bit limit).
   useEffect(() => {
+    loadedOnce.current = false;
     void load(symbol, barInterval);
+    const period = refreshPeriodMs(barInterval);
+    const timer = window.setInterval(() => void load(symbol, barInterval, true), period);
+    return () => window.clearInterval(timer);
   }, [symbol, barInterval, load]);
 
   return (
@@ -162,8 +173,9 @@ function History() {
           refresh
         </button>
         <span className="muted">
-          {state === 'loading' && 'loading…'}
-          {state === 'ready' && `${candles.length} candles`}
+          auto {refreshLabel(barInterval)}
+          {updatedAt && ` · updated ${updatedAt.toLocaleTimeString()}`}
+          {state === 'loading' && ' · loading…'}
         </span>
       </div>
       {state === 'error' ? (
@@ -171,7 +183,7 @@ function History() {
           could not reach the api ({error}) — is <code>cargo run -p api</code> running?
         </p>
       ) : (
-        <CandleChart candles={candles} />
+        <CandleChart candles={candles} interval={barInterval} />
       )}
     </section>
   );

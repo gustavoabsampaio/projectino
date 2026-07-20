@@ -136,3 +136,42 @@ p.empty {
 .chart .wick {
   stroke-width: 1;
 }
+
+.chart {
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.chart .crosshair {
+  stroke: currentColor;
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+  opacity: 0.5;
+}
+
+.chart .tooltip rect {
+  fill: Canvas;
+  stroke: var(--border);
+  opacity: 0.96;
+}
+
+.chart .tooltip text {
+  fill: currentColor;
+  font-size: 11px;
+}
+
+.chart-hint {
+  margin: 0.25rem 0 0;
+  font-size: 0.8rem;
+}
+
+button.link {
+  font: inherit;
+  font-size: inherit;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}

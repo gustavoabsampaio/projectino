@@ -86,6 +86,7 @@ make topics
 
 # 3. rust services
 cargo run -p ingestor         # streams Binance → Redpanda until Ctrl-C
+make backfill                 # one-shot: REST history for every interval → the lake
 cargo run -p hot-consumer     # market.* topics → SpacetimeDB reducers (needs module published)
 cargo run -p cold-consumer    # market.* topics → batched Parquet on MinIO
 cargo run -p api              # DataFusion over the lake; REST on :8081
@@ -156,7 +157,7 @@ of `cargo test --workspace`, so CI gates every push on them.
 ```
 crates/
   common/            shared types (Binance event models, symbols, config)   [implemented]
-  ingestor/          Binance websocket → Kafka producer                     [implemented]
+  ingestor/          Binance websocket → Kafka producer (+ REST backfill)   [implemented]
   hot-consumer/      Kafka → SpacetimeDB reducer calls                      [implemented]
   cold-consumer/     Kafka → batched Parquet on MinIO                       [implemented]
   spacetime-module/  SpacetimeDB server module (wasm)                       [skeleton]
@@ -189,10 +190,14 @@ leg. See the workflow footer.
 - Hot-consumer delivery: currently commit-after-enqueue with fire-and-forget
   reducer calls (safe for self-healing live-state upserts). A stricter
   commit-after-apply via the SDK `_then` callbacks, batched, is a follow-up.
-- Frontend polish: the candlestick chart is hand-rolled SVG (no chart library);
-  add axes/tooltips/zoom, and a trades-history view, as needed. Candle dedup
-  happens client-side because the lake is append-only (one row per kline
-  *update*) — an api-side "latest per open_time" aggregation would be cheaper.
+- Frontend polish: the candlestick chart is hand-rolled SVG (no chart library)
+  with zoom/pan, a crosshair tooltip, and visible-window auto-scaling. Possible
+  next steps: a volume sub-plot and a trades-history view. Candle dedup happens
+  client-side because the lake is append-only (one row per kline *update*) —
+  an api-side "latest per open_time" aggregation would be cheaper.
+- Backfill is one-shot and always fetches the most recent N candles; it has no
+  `startTime`/`endTime` paging, so it can't walk further back than 1000 candles
+  per interval.
 - API refinements: pagination / time-range filters, and a `Decimal128` lake
   schema so price aggregations don't need a cast.
 - API listing cost: DataFusion resolves the lake file list at table

@@ -3,12 +3,16 @@
 use anyhow::{Context, Result, ensure};
 use common::symbol::Symbol;
 
-/// Kline intervals accepted by Binance (verified 2026-07-05; see the
-/// `binance-api-reference` skill, `references/websocket-streams.md`).
-const KLINE_INTERVALS: &[&str] = &[
+/// Kline intervals accepted by Binance (verified 2026-07-20; see the
+/// `binance-api-reference` skill, `references/websocket-streams.md` and
+/// `references/rest-klines.md`). Note there is no `10m`, and a day is `1d`.
+pub const VALID_INTERVALS: &[&str] = &[
     "1s", "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w",
     "1M",
 ];
+
+/// Binance allows at most this many streams on one connection.
+const MAX_STREAMS_PER_CONNECTION: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -16,7 +20,8 @@ pub struct Config {
     /// Websocket base endpoint, no trailing slash and no path.
     pub ws_base: String,
     pub symbols: Vec<Symbol>,
-    pub kline_interval: String,
+    /// One kline stream is opened per symbol × interval.
+    pub kline_intervals: Vec<String>,
 }
 
 impl Config {
@@ -32,13 +37,16 @@ impl Config {
             .collect::<Result<Vec<_>>>()?;
         ensure!(!symbols.is_empty(), "SYMBOLS must name at least one symbol");
 
-        let kline_interval = common::config::optional("KLINE_INTERVAL", "1m");
-        ensure!(
-            KLINE_INTERVALS.contains(&kline_interval.as_str()),
-            "KLINE_INTERVAL `{kline_interval}` is not a Binance kline interval"
-        );
+        // `KLINE_INTERVALS` (plural) is the current setting; the older singular
+        // `KLINE_INTERVAL` still works so existing .env files keep running.
+        let default_intervals = VALID_INTERVALS.join(",");
+        let raw = match common::config::optional("KLINE_INTERVALS", "").as_str() {
+            "" => common::config::optional("KLINE_INTERVAL", &default_intervals),
+            list => list.to_string(),
+        };
+        let kline_intervals = parse_intervals(&raw)?;
 
-        Ok(Self {
+        let cfg = Self {
             kafka_brokers: common::config::required("KAFKA_BROKERS")?,
             // data-stream.binance.vision serves market data only — exactly
             // this service's scope (verified against the websocket docs).
@@ -47,24 +55,31 @@ impl Config {
                 "wss://data-stream.binance.vision",
             ),
             symbols,
-            kline_interval,
-        })
+            kline_intervals,
+        };
+
+        let streams = cfg.stream_names().len();
+        ensure!(
+            streams <= MAX_STREAMS_PER_CONNECTION,
+            "{streams} streams exceeds Binance's limit of {MAX_STREAMS_PER_CONNECTION} per connection — \
+             reduce SYMBOLS or KLINE_INTERVALS"
+        );
+        Ok(cfg)
     }
 
-    /// Stream names to subscribe to, one aggTrade + bookTicker + kline per
-    /// symbol. Symbols are lowercase in stream names per the docs.
+    /// Stream names to subscribe to: aggTrade + bookTicker per symbol, plus one
+    /// kline stream per symbol × interval. Symbols are lowercase per the docs.
     pub fn stream_names(&self) -> Vec<String> {
-        self.symbols
-            .iter()
-            .flat_map(|sym| {
-                let s = sym.as_stream_symbol();
-                [
-                    format!("{s}@aggTrade"),
-                    format!("{s}@bookTicker"),
-                    format!("{s}@kline_{}", self.kline_interval),
-                ]
-            })
-            .collect()
+        let mut names = Vec::new();
+        for symbol in &self.symbols {
+            let s = symbol.as_stream_symbol();
+            names.push(format!("{s}@aggTrade"));
+            names.push(format!("{s}@bookTicker"));
+            for interval in &self.kline_intervals {
+                names.push(format!("{s}@kline_{interval}"));
+            }
+        }
+        names
     }
 
     /// Combined-stream URL: `<base>/stream?streams=<a>/<b>/<c>`. Using the
@@ -79,31 +94,71 @@ impl Config {
     }
 }
 
+/// Parse and validate a comma-separated interval list.
+pub fn parse_intervals(raw: &str) -> Result<Vec<String>> {
+    let intervals: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    ensure!(
+        !intervals.is_empty(),
+        "at least one kline interval is required"
+    );
+    for interval in &intervals {
+        ensure!(
+            VALID_INTERVALS.contains(&interval.as_str()),
+            "`{interval}` is not a Binance kline interval (valid: {})",
+            VALID_INTERVALS.join(" ")
+        );
+    }
+    Ok(intervals)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn test_config() -> Config {
+    fn test_config(intervals: &[&str]) -> Config {
         Config {
             kafka_brokers: "localhost:19092".to_string(),
             ws_base: "wss://data-stream.binance.vision".to_string(),
             symbols: vec![Symbol::BtcUsdt],
-            kline_interval: "1m".to_string(),
+            kline_intervals: intervals.iter().map(|s| s.to_string()).collect(),
         }
     }
 
     #[test]
     fn builds_combined_stream_url() {
         assert_eq!(
-            test_config().combined_stream_url(),
+            test_config(&["1m"]).combined_stream_url(),
             "wss://data-stream.binance.vision/stream?streams=btcusdt@aggTrade/btcusdt@bookTicker/btcusdt@kline_1m"
         );
     }
 
     #[test]
-    fn three_streams_per_symbol() {
-        let mut cfg = test_config();
+    fn one_kline_stream_per_symbol_and_interval() {
+        let mut cfg = test_config(&["1m", "1h", "1d"]);
         cfg.symbols = vec![Symbol::BtcUsdt, Symbol::EthUsdt];
-        assert_eq!(cfg.stream_names().len(), 6);
+        // 2 symbols × (aggTrade + bookTicker + 3 klines)
+        assert_eq!(cfg.stream_names().len(), 2 * (2 + 3));
+        assert!(cfg.stream_names().contains(&"ethusdt@kline_1d".to_string()));
+    }
+
+    #[test]
+    fn rejects_intervals_binance_does_not_have() {
+        // The two most tempting mistakes: 10m doesn't exist, and a day is `1d`.
+        assert!(parse_intervals("10m").is_err());
+        assert!(parse_intervals("24h").is_err());
+        assert!(parse_intervals("1m,1d").is_ok());
+    }
+
+    #[test]
+    fn full_binance_set_parses() {
+        assert_eq!(
+            parse_intervals(&VALID_INTERVALS.join(",")).unwrap().len(),
+            VALID_INTERVALS.len()
+        );
     }
 }
