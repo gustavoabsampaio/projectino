@@ -63,8 +63,76 @@ td.num {
   font-variant-numeric: tabular-nums;
 }
 
-td.empty {
+td.empty,
+p.empty {
   color: var(--muted);
   text-align: center;
   padding: 1rem;
+}
+
+.muted {
+  color: var(--muted);
+  font-weight: normal;
+}
+
+/* history controls */
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.5rem 0 0.75rem;
+  flex-wrap: wrap;
+}
+
+.controls button {
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.2rem 0.6rem;
+  color: inherit;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.controls button:hover {
+  border-color: currentColor;
+}
+
+.controls button.active {
+  border-color: currentColor;
+  font-weight: bold;
+}
+
+/* candlestick chart */
+.chart {
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+
+.chart .grid {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+
+.chart .axis {
+  fill: var(--muted);
+  font-size: 11px;
+}
+
+.chart .up .body,
+.chart .up .wick {
+  fill: #16a34a;
+  stroke: #16a34a;
+}
+
+.chart .down .body,
+.chart .down .wick {
+  fill: #dc2626;
+  stroke: #dc2626;
+}
+
+.chart .wick {
+  stroke-width: 1;
 }

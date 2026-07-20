@@ -1,5 +1,13 @@
+import { useCallback, useEffect, useState } from 'react';
 import { useSpacetimeDB, useTable } from 'spacetimedb/react';
 import { tables } from './module_bindings';
+import CandleChart from './components/CandleChart';
+import { fetchCandles, type KlineRow } from './lib/api';
+
+const SYMBOLS = ['BTCUSDT', 'ETHUSDT'];
+// Must match what the ingestor recorded (KLINE_INTERVAL); 1s fills a chart fast,
+// 1m needs minutes of history to accumulate distinct candles.
+const INTERVALS = ['1s', '1m'];
 
 /** Sort a copy of the rows by symbol for stable rendering. */
 function bySymbol<T extends { symbol: string }>(rows: readonly T[]): T[] {
@@ -7,30 +15,44 @@ function bySymbol<T extends { symbol: string }>(rows: readonly T[]): T[] {
 }
 
 export default function App() {
-  const conn = useSpacetimeDB();
-  // Each hook subscribes to a public live-state table and re-renders on change.
-  const [trades] = useTable(tables.live_trade);
-  const [tickers] = useTable(tables.live_book_ticker);
-  const [klines] = useTable(tables.live_kline);
+  return (
+    <main className="app">
+      <header>
+        <h1>projectino — crypto market pipeline</h1>
+        <LiveStatus />
+      </header>
+      <Live />
+      <History />
+    </main>
+  );
+}
 
+function LiveStatus() {
+  const conn = useSpacetimeDB();
   const status = conn.connectionError
     ? `error: ${conn.connectionError.message}`
     : conn.isActive
       ? 'connected'
       : 'connecting…';
+  return (
+    <p>
+      SpacetimeDB: <span className={conn.isActive ? 'ok' : 'wait'}>{status}</span>
+      {' · '}live state from the hot path, history from the Parquet lake
+    </p>
+  );
+}
+
+/** Live state: pushed from SpacetimeDB subscriptions (hot path). */
+function Live() {
+  const [trades] = useTable(tables.live_trade);
+  const [tickers] = useTable(tables.live_book_ticker);
 
   return (
-    <main className="app">
-      <header>
-        <h1>projectino — live market state</h1>
-        <p>
-          SpacetimeDB: <span className={conn.isActive ? 'ok' : 'wait'}>{status}</span>
-          {' · '}driven live by the hot-consumer
-        </p>
-      </header>
-
+    <>
       <section>
-        <h2>Book tickers</h2>
+        <h2>
+          Book tickers <span className="muted">— live</span>
+        </h2>
         <table>
           <thead>
             <tr>
@@ -57,7 +79,9 @@ export default function App() {
       </section>
 
       <section>
-        <h2>Latest trades</h2>
+        <h2>
+          Latest trades <span className="muted">— live</span>
+        </h2>
         <table>
           <thead>
             <tr>
@@ -80,36 +104,76 @@ export default function App() {
           </tbody>
         </table>
       </section>
+    </>
+  );
+}
 
-      <section>
-        <h2>Current candles</h2>
-        <table>
-          <thead>
-            <tr>
-              <th>Symbol</th>
-              <th>Interval</th>
-              <th>Open</th>
-              <th>High</th>
-              <th>Low</th>
-              <th>Close</th>
-            </tr>
-          </thead>
-          <tbody>
-            {bySymbol(klines).map((k) => (
-              <tr key={k.id}>
-                <td>{k.symbol}</td>
-                <td>{k.barInterval}</td>
-                <td className="num">{k.open}</td>
-                <td className="num">{k.high}</td>
-                <td className="num">{k.low}</td>
-                <td className="num">{k.close}</td>
-              </tr>
-            ))}
-            {klines.length === 0 && <EmptyRow cols={6} />}
-          </tbody>
-        </table>
-      </section>
-    </main>
+/** History: fetched from the Axum + DataFusion api over the Parquet lake. */
+function History() {
+  const [symbol, setSymbol] = useState('BTCUSDT');
+  const [barInterval, setBarInterval] = useState('1m');
+  const [candles, setCandles] = useState<KlineRow[]>([]);
+  const [state, setState] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [error, setError] = useState('');
+
+  const load = useCallback(async (sym: string, interval: string) => {
+    setState('loading');
+    try {
+      setCandles(await fetchCandles(sym, interval));
+      setState('ready');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setState('error');
+    }
+  }, []);
+
+  useEffect(() => {
+    void load(symbol, barInterval);
+  }, [symbol, barInterval, load]);
+
+  return (
+    <section>
+      <h2>
+        Candles <span className="muted">— history, from the Parquet lake</span>
+      </h2>
+      <div className="controls">
+        {SYMBOLS.map((s) => (
+          <button
+            key={s}
+            type="button"
+            className={s === symbol ? 'active' : ''}
+            onClick={() => setSymbol(s)}
+          >
+            {s}
+          </button>
+        ))}
+        <span className="muted">|</span>
+        {INTERVALS.map((i) => (
+          <button
+            key={i}
+            type="button"
+            className={i === barInterval ? 'active' : ''}
+            onClick={() => setBarInterval(i)}
+          >
+            {i}
+          </button>
+        ))}
+        <button type="button" onClick={() => void load(symbol, barInterval)}>
+          refresh
+        </button>
+        <span className="muted">
+          {state === 'loading' && 'loading…'}
+          {state === 'ready' && `${candles.length} candles`}
+        </span>
+      </div>
+      {state === 'error' ? (
+        <p className="empty">
+          could not reach the api ({error}) — is <code>cargo run -p api</code> running?
+        </p>
+      ) : (
+        <CandleChart candles={candles} />
+      )}
+    </section>
   );
 }
 

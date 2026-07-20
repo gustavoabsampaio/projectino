@@ -19,7 +19,11 @@ and writes partitioned Parquet to the MinIO lake (deterministic, idempotent
 filenames; offsets committed only after upload), and the `api` crate serves
 historical queries over that lake with **DataFusion** — registering the Parquet
 as tables and answering typed REST endpoints (`/trades`, `/book_tickers`,
-`/klines`). All that remains is wiring history charts into the frontend.
+`/klines`).
+
+The frontend renders **both halves**: live tables pushed from SpacetimeDB, and a
+candlestick chart of history fetched from the api — so the pipeline runs end to
+end, exchange to browser, on both the hot and cold paths.
 
 ## Architecture
 
@@ -110,7 +114,7 @@ bun run dev                   # http://localhost:5173
 | Lake files (cold path) | run `cold-consumer`, then browse http://localhost:9001 → bucket `market-lake` (Parquet under `market.trades/partition=…/`) |
 | Axum API (health) | `curl http://localhost:8081/health` → `{"status":"ok"}` |
 | History query (cold path) | `curl "http://localhost:8081/trades?symbol=BTCUSDT&limit=5"` (also `/book_tickers`, `/klines?symbol=…&interval=1m`) |
-| Frontend | http://localhost:5173 — prints SpacetimeDB status on page & console |
+| Frontend | http://localhost:5173 — live tables (hot path) + candlestick chart (cold path). Needs the `api` running for history; pick `1s` for a chart that fills in seconds |
 
 ## Testing the ingestor
 
@@ -185,9 +189,10 @@ leg. See the workflow footer.
 - Hot-consumer delivery: currently commit-after-enqueue with fire-and-forget
   reducer calls (safe for self-healing live-state upserts). A stricter
   commit-after-apply via the SDK `_then` callbacks, batched, is a follow-up.
-- Frontend history: wire charts fed by the `api` endpoints (`/trades`,
-  `/klines`, …) alongside the live tables. The api will need CORS for the
-  browser origin, and prices are strings (cast in queries as needed).
+- Frontend polish: the candlestick chart is hand-rolled SVG (no chart library);
+  add axes/tooltips/zoom, and a trades-history view, as needed. Candle dedup
+  happens client-side because the lake is append-only (one row per kline
+  *update*) — an api-side "latest per open_time" aggregation would be cheaper.
 - API refinements: pagination / time-range filters; a `Decimal128` lake schema
   so price aggregations don't need a cast; lazy table (re)registration so a
   restart isn't needed when the first data lands.

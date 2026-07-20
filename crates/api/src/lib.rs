@@ -14,13 +14,14 @@ use anyhow::{Context, Result};
 use arrow::array::RecordBatch;
 use arrow::json::ArrayWriter;
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use datafusion::prelude::*;
 use object_store::aws::AmazonS3Builder;
 use serde::Deserialize;
+use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 use url::Url;
 
@@ -39,11 +40,23 @@ type AppState = Arc<SessionContext>;
 
 pub async fn run(cfg: Config) -> Result<()> {
     let ctx = build_context(&cfg).await?;
+
+    // The browser frontend runs on a different port, so it needs CORS. Scoped
+    // to one configured origin (not wide open) and read-only methods.
+    let cors = CorsLayer::new()
+        .allow_origin(
+            cfg.cors_origin
+                .parse::<HeaderValue>()
+                .with_context(|| format!("invalid API_CORS_ORIGIN `{}`", cfg.cors_origin))?,
+        )
+        .allow_methods([Method::GET]);
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/trades", get(trades))
         .route("/book_tickers", get(book_tickers))
         .route("/klines", get(klines))
+        .layer(cors)
         .with_state(Arc::new(ctx));
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen_addr)

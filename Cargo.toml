@@ -69,6 +69,8 @@ spacetimedb-sdk = "=2.6.1"
 thiserror = "=2.0.18"
 tokio = { version = "=1.52.3", features = ["macros", "rt-multi-thread", "net", "time", "signal", "fs", "io-util"] }
 tokio-tungstenite = { version = "=0.29.0", features = ["rustls-tls-webpki-roots"] }
+# CORS for the api so the browser frontend (different port) can call it
+tower-http = { version = "=0.6.11", features = ["cors"] }
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 # for the api's DataFusion object-store registration (base s3:// URL)

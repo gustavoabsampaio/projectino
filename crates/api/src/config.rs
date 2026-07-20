@@ -10,6 +10,8 @@ pub struct Config {
     pub minio_secret_key: String,
     pub minio_region: String,
     pub bucket: String,
+    /// Browser origin allowed to call this api (the Vite dev server by default).
+    pub cors_origin: String,
 }
 
 impl Config {
@@ -21,6 +23,7 @@ impl Config {
             minio_secret_key: common::config::required("MINIO_SECRET_KEY")?,
             minio_region: common::config::optional("MINIO_REGION", "us-east-1"),
             bucket: common::config::required("LAKE_BUCKET")?,
+            cors_origin: common::config::optional("API_CORS_ORIGIN", "http://localhost:5173"),
         })
     }
 }
