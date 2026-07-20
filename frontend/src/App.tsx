@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useSpacetimeDB, useTable } from 'spacetimedb/react';
 import { tables } from './module_bindings';
 import CandleChart from './components/CandleChart';
@@ -115,32 +115,51 @@ function History() {
   const [error, setError] = useState('');
 
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
-  // Skip the "loading" flash on background polls — only the first load and
-  // explicit refreshes should blank the chart.
-  const loadedOnce = useRef(false);
+  // Bumping this re-runs the effect below — that's the manual refresh.
+  const [reloadToken, setReloadToken] = useState(0);
 
-  const load = useCallback(async (sym: string, interval: string, quiet = false) => {
-    if (!quiet || !loadedOnce.current) setState('loading');
-    try {
-      setCandles(await fetchCandles(sym, interval));
-      setState('ready');
-      setUpdatedAt(new Date());
-      loadedOnce.current = true;
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-      setState('error');
-    }
-  }, []);
-
-  // Reload on selection change, then poll at the candle's own cadence:
+  // Load on selection change, then poll at the candle's own cadence:
   // 1s → every 1s, 1h → every 1h, capped at 24h (setInterval's 32-bit limit).
+  //
+  // Two guards keep a stale response from winning:
+  //  - `cancelled` + `abort` — when the selection changes, a request that was
+  //    already in flight (very likely at 1s) must not overwrite the new
+  //    interval's data when it lands.
+  //  - `seq` — if the api is slower than the poll period, responses can arrive
+  //    out of order; only the newest one may apply.
   useEffect(() => {
-    loadedOnce.current = false;
-    void load(symbol, barInterval);
-    const period = refreshPeriodMs(barInterval);
-    const timer = window.setInterval(() => void load(symbol, barInterval, true), period);
-    return () => window.clearInterval(timer);
-  }, [symbol, barInterval, load]);
+    let cancelled = false;
+    let seq = 0;
+    let firstLoad = true;
+    const controller = new AbortController();
+
+    const run = async () => {
+      const current = ++seq;
+      if (firstLoad) setState('loading');
+      try {
+        const rows = await fetchCandles(symbol, barInterval, { signal: controller.signal });
+        if (cancelled || current !== seq) return; // superseded
+        setCandles(rows);
+        setState('ready');
+        setUpdatedAt(new Date());
+      } catch (err) {
+        // An abort is expected when the selection changes — not an error.
+        if (cancelled || controller.signal.aborted) return;
+        setError(err instanceof Error ? err.message : String(err));
+        setState('error');
+      } finally {
+        firstLoad = false;
+      }
+    };
+
+    void run();
+    const timer = window.setInterval(() => void run(), refreshPeriodMs(barInterval));
+    return () => {
+      cancelled = true;
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [symbol, barInterval, reloadToken]);
 
   return (
     <section>
@@ -169,7 +188,7 @@ function History() {
             {i}
           </button>
         ))}
-        <button type="button" onClick={() => void load(symbol, barInterval)}>
+        <button type="button" onClick={() => setReloadToken((t) => t + 1)}>
           refresh
         </button>
         <span className="muted">

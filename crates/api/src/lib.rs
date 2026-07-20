@@ -195,19 +195,45 @@ async fn book_tickers(
     Ok(Json(batches_to_json(&df.collect().await?)?))
 }
 
+/// Candles, densest-first.
+///
+/// The lake is append-only: the *forming* candle gets a new row every couple of
+/// seconds, so a plain `ORDER BY open_time DESC LIMIT n` spends most of its row
+/// budget on hundreds of copies of the newest bar (measured: 611 of 1000 rows
+/// for one 1d candle). Closed candles have exactly one final row each, so we
+/// take those for the history and append the single newest forming row — the
+/// row budget then maps ~1:1 onto candles.
 async fn klines(
     State(state): State<SharedState>,
     Query(p): Query<Params>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let table = fresh_table(&state, KLINES, topics::KLINES).await?;
-    let mut df = with_symbol(table, &p.symbol)?;
-    if let Some(interval) = &p.interval {
-        df = df.filter(col("interval").eq(lit(interval.as_str())))?;
-    }
-    let df = df
+
+    let scoped = |df: DataFrame| -> Result<DataFrame, AppError> {
+        let df = with_symbol(df, &p.symbol)?;
+        match &p.interval {
+            Some(interval) => Ok(df.filter(col("interval").eq(lit(interval.as_str())))?),
+            None => Ok(df),
+        }
+    };
+
+    let closed = scoped(table.clone())?
+        .filter(col("is_closed").eq(lit(true)))?
         .sort(vec![col("open_time").sort(false, false)])?
         .limit(0, Some(clamp_limit(p.limit)))?;
-    Ok(Json(batches_to_json(&df.collect().await?)?))
+    let mut batches = closed.collect().await?;
+
+    // The still-forming candle: newest open_time, newest update of it.
+    let forming = scoped(table)?
+        .filter(col("is_closed").eq(lit(false)))?
+        .sort(vec![
+            col("open_time").sort(false, false),
+            col("kafka_offset").sort(false, false),
+        ])?
+        .limit(0, Some(1))?;
+    batches.extend(forming.collect().await?);
+
+    Ok(Json(batches_to_json(&batches)?))
 }
 
 /// Serialize Arrow record batches to a JSON array of row objects.

@@ -40,12 +40,18 @@ export interface TradeRow {
 
 type Params = Record<string, string | number | undefined>;
 
-async function getRows<T>(path: string, params: Params): Promise<T[]> {
+/** Extra request options; `signal` lets callers abort a superseded fetch. */
+export interface RequestOptions {
+  limit?: number;
+  signal?: AbortSignal;
+}
+
+async function getRows<T>(path: string, params: Params, signal?: AbortSignal): Promise<T[]> {
   const url = new URL(path, API_URL);
   for (const [key, value] of Object.entries(params)) {
     if (value !== undefined) url.searchParams.set(key, String(value));
   }
-  const res = await fetch(url);
+  const res = await fetch(url, { signal });
   if (!res.ok) {
     throw new Error(`GET ${path} failed: ${res.status} ${res.statusText}`);
   }
@@ -70,11 +76,15 @@ export function dedupeCandles(rows: KlineRow[]): KlineRow[] {
 export async function fetchCandles(
   symbol: string,
   interval = '1m',
-  limit = 1000,
+  { limit = 1000, signal }: RequestOptions = {},
 ): Promise<KlineRow[]> {
-  return dedupeCandles(await getRows<KlineRow>('/klines', { symbol, interval, limit }));
+  const rows = await getRows<KlineRow>('/klines', { symbol, interval, limit }, signal);
+  return dedupeCandles(rows);
 }
 
-export async function fetchTrades(symbol: string, limit = 20): Promise<TradeRow[]> {
-  return getRows<TradeRow>('/trades', { symbol, limit });
+export async function fetchTrades(
+  symbol: string,
+  { limit = 20, signal }: RequestOptions = {},
+): Promise<TradeRow[]> {
+  return getRows<TradeRow>('/trades', { symbol, limit }, signal);
 }
