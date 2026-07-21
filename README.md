@@ -268,11 +268,34 @@ leg. See the workflow footer.
   next steps: a volume sub-plot and a trades-history view. Candle dedup happens
   client-side because the lake is append-only (one row per kline *update*) —
   an api-side "latest per open_time" aggregation would be cheaper.
-- Backfill is one-shot and always fetches the most recent N candles; it has no
-  `startTime`/`endTime` paging, so it can't walk further back than 1000 candles
-  per interval.
-- API refinements: pagination / time-range filters, and a `Decimal128` lake
-  schema so price aggregations don't need a cast.
+- **Historical depth, pagination, and a well-defined chart window.** Three gaps
+  that are really one problem, and only make sense fixed together:
+  1. *Backfill* is one-shot and always fetches the most recent N candles. It has
+     no `startTime`/`endTime` paging, so it cannot walk back beyond 1000 candles
+     per interval — deep history simply never enters the lake.
+  2. *`/klines`* has no pagination or time-range filters. It answers "the newest
+     N" and nothing else, so a client cannot ask for an earlier window. Panning
+     the chart past the loaded range shows empty space rather than fetching more.
+  3. *The chart* therefore displays whatever one request happened to return. What
+     is on screen depends on when the page loaded, how much history the lake had
+     at that moment, and — at `1s` — how much the live window has accumulated
+     since. Two clients can legitimately show different candle counts for the
+     same symbol and interval, and neither is wrong.
+
+  The fix is the whole chain: backfill pages backwards to a target depth,
+  `/klines` accepts an explicit time range and pages, and the chart requests a
+  window it names rather than "the latest N", fetching more as the user pans.
+  Until that lands, treat the displayed range as best-effort rather than a
+  guarantee — it is not a bug that two sessions disagree.
+- API refinements: a `Decimal128` lake schema so price aggregations don't need a
+  cast.
+- The chart's interval list (`INTERVALS` in `frontend/src/lib/intervals.ts`) must
+  be kept in sync by hand with `DEFAULT_INTERVALS` in
+  `crates/ingestor/src/config.rs` — one is TypeScript, the other Rust, and
+  nothing checks them against each other at build time. Offering an interval the
+  ingestor does not stream renders stale lake history that never updates, with
+  nothing on screen explaining why. A CI check comparing the two lists would
+  close this properly.
 - Lake listing is cached behind `API_LISTING_TTL_MS` (default 3s) rather than
   re-listed per request — see "Listing freshness" above. The remaining ~1.1s per
   query is the Parquet scan itself. `1s` no longer polls at all (see "The live
@@ -292,11 +315,19 @@ leg. See the workflow footer.
   events/s) and latency (decode time, Kafka produce time) instrumentation, plus
   consumer lag / reconnect counts as structured `tracing` fields that can later
   back a metrics exporter.
-- Ingestor throughput scaling: the read loop awaits each Kafka produce inline
-  (`publish().await` in `ingestor::lib`), which caps throughput at ~1/ack-latency
-  and limits librdkafka batching — fine at current scale, a bottleneck as streams
-  grow (bookTicker dominates). When the metrics above show the ceiling: (1)
-  decouple produce from read via a *bounded* mpsc channel or `FuturesUnordered`
-  (keep bounded for backpressure), then (2) shard into multiple websocket
-  connections partitioned by symbol group. Any parallelism must preserve
-  per-symbol ordering (messages are keyed by symbol).
+- Ingestor throughput scaling: step (1) is **done** — the read loop no longer
+  awaits each produce inline; `publish` queues via `send_result` and librdkafka
+  batches (measured 2026-07-21: ceiling was ~130–140 msg/s with lag growing to
+  ~96s; afterwards 237 msg/s sustained with lag under 1s, and the ceiling was
+  never reached). Step (2) remains if a single connection is outgrown: shard
+  into multiple websocket connections partitioned by symbol group. Any
+  parallelism must preserve per-symbol ordering (messages are keyed by symbol).
+- Unexplained: with the old awaited-send ingestor, the Binance websocket dropped
+  with `Connection reset without closing handshake` at almost exactly 10 minutes,
+  twice (10m02s, 9m59s). No documented limit was being approached — streams,
+  connection attempts, outbound message rate and REST weight all had 30×+
+  headroom. After the pipelining fix one connection ran 12.6 min without a drop,
+  consistent with having been dropped as a slow consumer, but that is one
+  observation against two. If it recurs, test with a single low-volume stream:
+  a drop with no backlog would point at the endpoint or the network path rather
+  than at us.

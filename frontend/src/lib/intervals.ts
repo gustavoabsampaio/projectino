@@ -1,9 +1,11 @@
 // Binance kline intervals and their durations.
-//
-// This is the full documented set (verified against binance-spot-api-docs):
-// there is no `10m`, and a day is `1d`, not `24h`.
 
-export const INTERVALS = [
+/**
+ * Every interval Binance documents (verified against binance-spot-api-docs):
+ * there is no `10m`, no `3h`, and a day is `1d`, not `24h`. Kept complete so
+ * `INTERVAL_MS` stays correct for any interval that gets re-enabled.
+ */
+export const ALL_INTERVALS = [
   '1s',
   '1m',
   '3m',
@@ -22,6 +24,31 @@ export const INTERVALS = [
   '1M',
 ] as const;
 
+/**
+ * The intervals the chart offers.
+ *
+ * **Must match `DEFAULT_INTERVALS` in `crates/ingestor/src/config.rs`.** The
+ * ingestor only subscribes to those, so offering one it doesn't stream is worse
+ * than omitting it: the chart would render whatever stale history the lake
+ * happens to hold and then never update, with nothing on screen saying why.
+ *
+ * Nothing enforces this at build time — one list is Rust, the other TypeScript —
+ * so changing either means changing both.
+ */
+export const INTERVALS = [
+  '1s',
+  '1m',
+  '5m',
+  '15m',
+  '30m',
+  '1h',
+  '6h',
+  '12h',
+  '1d',
+  '1w',
+  '1M',
+] as const;
+
 export type Interval = (typeof INTERVALS)[number];
 
 const SECOND = 1_000;
@@ -29,7 +56,7 @@ const MINUTE = 60 * SECOND;
 const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
 
-/** Nominal duration of one candle, in milliseconds. */
+/** Nominal duration of one candle, in milliseconds. Covers `ALL_INTERVALS`. */
 export const INTERVAL_MS: Record<string, number> = {
   '1s': SECOND,
   '1m': MINUTE,
