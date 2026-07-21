@@ -7,13 +7,19 @@
 //! [`Sink`]: live production goes to Kafka, replay goes nowhere.
 
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use tracing::{debug, warn};
 
 use crate::decode::{Decoded, MarketEvent, decode_combined_frame};
+
+/// How long to wait before retrying a send that librdkafka's queue rejected.
+const QUEUE_FULL_RETRY: Duration = Duration::from_millis(50);
 
 /// What the caller should do after a handled frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,17 +70,43 @@ impl fmt::Display for Stats {
     }
 }
 
+/// Messages librdkafka ultimately failed to deliver.
+///
+/// Deliveries are no longer awaited inline (see [`publish`]), so a failure
+/// can't propagate to the read loop as a `Result` any more. It is observed on a
+/// detached task and tallied here instead — shared across those tasks, hence
+/// the atomic. A non-zero count means events were accepted from Binance but
+/// never made it to Kafka, so it belongs in the shutdown summary.
+#[derive(Debug, Default, Clone)]
+pub struct DeliveryErrors(Arc<AtomicU64>);
+
+impl DeliveryErrors {
+    fn record(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn count(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 /// Destination for decoded events. `Kafka` is the live path; `Null` validates
 /// the decode path with no external dependency (replay + integration tests).
 pub enum Sink<'a> {
-    Kafka(&'a FutureProducer),
+    Kafka {
+        producer: &'a FutureProducer,
+        delivery_errors: DeliveryErrors,
+    },
     Null,
 }
 
 impl Sink<'_> {
     async fn accept(&self, event: &MarketEvent) -> Result<()> {
         match self {
-            Sink::Kafka(producer) => publish(producer, event).await,
+            Sink::Kafka {
+                producer,
+                delivery_errors,
+            } => publish(producer, event, delivery_errors).await,
             Sink::Null => Ok(()),
         }
     }
@@ -108,29 +140,70 @@ pub async fn handle_frame(text: &str, sink: &Sink<'_>, stats: &mut Stats) -> Res
     }
 }
 
-async fn publish(producer: &FutureProducer, event: &MarketEvent) -> Result<()> {
+/// Queue an event for delivery without waiting for the broker to acknowledge it.
+///
+/// This used to `send(...).await` each record before the caller read the next
+/// websocket frame. That was described as "natural backpressure", and it was —
+/// but it also serialized the entire pipeline: throughput was capped at one
+/// message per broker round-trip, measured at 7.7ms, i.e. ~130 msg/s. Worse, it
+/// meant librdkafka could only ever hold one message in flight, so its batching
+/// never engaged and every message paid a full round-trip. Binance's combined
+/// stream bursts past 130 msg/s, so the read loop fell behind, frames queued in
+/// the socket, and the backlog showed up downstream as multi-second lag.
+///
+/// Now the record goes into librdkafka's internal queue and returns
+/// immediately, letting it batch many messages per broker request. Ordering is
+/// unaffected: `enable.idempotence=true` preserves per-partition ordering
+/// across in-flight batches, which is exactly the guarantee that made awaiting
+/// unnecessary in the first place.
+///
+/// Backpressure hasn't been removed, it moved: when the internal queue fills,
+/// `send_result` hands the record back with `QueueFull` and we wait and retry
+/// rather than drop it. That still bounds memory, but it only engages when the
+/// broker is genuinely behind instead of on every single message.
+async fn publish(
+    producer: &FutureProducer,
+    event: &MarketEvent,
+    delivery_errors: &DeliveryErrors,
+) -> Result<()> {
     let payload = event
         .to_envelope_json()
         .context("serializing event envelope")?;
-    let record = FutureRecord::to(event.topic())
-        .key(event.key())
-        .payload(&payload);
+    let topic = event.topic();
+    let mut record = FutureRecord::to(topic).key(event.key()).payload(&payload);
 
-    // Awaiting the delivery future applies natural backpressure: the read loop
-    // can't outrun the broker. Revisit (pipelined sends) if throughput demands.
-    let delivery = producer
-        .send(record, Duration::from_secs(5))
-        .await
-        .map_err(|(error, _msg)| anyhow!(error))
-        .with_context(|| format!("producing to {}", event.topic()))?;
-    debug!(
-        topic = event.topic(),
-        key = event.key(),
-        partition = delivery.partition,
-        offset = delivery.offset,
-        "event published"
-    );
-    Ok(())
+    loop {
+        match producer.send_result(record) {
+            Ok(delivery) => {
+                debug!(topic, key = event.key(), "event queued");
+                // Nothing downstream can act on a delivery failure, but it must
+                // not be silent: observe it on a detached task purely to log
+                // and count. The task is bounded by the queue above.
+                let errors = delivery_errors.clone();
+                tokio::spawn(async move {
+                    match delivery.await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err((error, _msg))) => {
+                            errors.record();
+                            warn!(topic, error = %error, "delivery failed");
+                        }
+                        Err(_canceled) => {
+                            errors.record();
+                            warn!(topic, "delivery result dropped before completion");
+                        }
+                    }
+                });
+                return Ok(());
+            }
+            Err((KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), returned)) => {
+                record = returned;
+                tokio::time::sleep(QUEUE_FULL_RETRY).await;
+            }
+            Err((error, _returned)) => {
+                return Err(anyhow!(error)).with_context(|| format!("producing to {topic}"));
+            }
+        }
+    }
 }
 
 /// Char-boundary-safe truncation for logging payload snippets.

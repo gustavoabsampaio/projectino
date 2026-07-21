@@ -28,7 +28,7 @@ use tracing::{info, warn};
 
 use crate::backoff::Backoff;
 use crate::config::Config;
-use crate::handler::{FrameAction, Sink, Stats, handle_frame};
+use crate::handler::{DeliveryErrors, FrameAction, Sink, Stats, handle_frame};
 
 /// A connection that survives this long is considered healthy: the next
 /// failure restarts backoff from the base delay instead of escalating.
@@ -49,6 +49,9 @@ pub async fn run(cfg: Config) -> Result<()> {
     let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(60));
     let mut reconnects: u64 = 0;
     let mut stats = Stats::default();
+    // Delivery is no longer awaited per message, so failures surface here
+    // rather than as an error from the read loop.
+    let delivery_errors = DeliveryErrors::default();
 
     loop {
         let started = Instant::now();
@@ -57,7 +60,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                 info!("shutdown signal received");
                 break;
             }
-            result = stream_once(&cfg, &producer, dump.as_mut(), &mut stats) => {
+            result = stream_once(&cfg, &producer, dump.as_mut(), &mut stats, &delivery_errors) => {
                 if started.elapsed() >= HEALTHY_CONNECTION {
                     backoff.reset();
                 }
@@ -93,7 +96,13 @@ pub async fn run(cfg: Config) -> Result<()> {
     producer
         .flush(Duration::from_secs(10))
         .context("flushing Kafka producer during shutdown")?;
-    info!(%stats, "ingestor stopped");
+    // Post-flush: anything still counted here was accepted from Binance but
+    // never reached Kafka.
+    info!(
+        %stats,
+        delivery_errors = delivery_errors.count(),
+        "ingestor stopped"
+    );
     Ok(())
 }
 
@@ -137,6 +146,7 @@ async fn stream_once(
     producer: &FutureProducer,
     mut dump: Option<&mut RawDump>,
     stats: &mut Stats,
+    delivery_errors: &DeliveryErrors,
 ) -> Result<()> {
     let url = cfg.combined_stream_url();
     let (mut ws, response) = connect_async(url.as_str())
@@ -149,7 +159,10 @@ async fn stream_once(
         "connected to Binance combined stream"
     );
 
-    let sink = Sink::Kafka(producer);
+    let sink = Sink::Kafka {
+        producer,
+        delivery_errors: delivery_errors.clone(),
+    };
     while let Some(frame) = ws.next().await {
         match frame.context("websocket protocol error")? {
             Message::Text(text) => {
