@@ -9,8 +9,11 @@ yanked = "deny"
 # on the next dependency bump — the fixes may arrive transitively. Reviewed
 # 2026-07-20.
 ignore = [
-    # `paste` is unmaintained (proc-macro, no runtime vuln). Via datafusion,
-    # which is only pulled in by the not-yet-implemented `api` skeleton.
+    # `paste` is unmaintained (proc-macro, no runtime vuln). Via datafusion.
+    # NOTE 2026-07-21: this was deferred on the grounds that datafusion was only
+    # pulled in by a not-yet-implemented `api` skeleton. The api is implemented
+    # and running now, so that reasoning no longer applies — the deferral stands
+    # only on "proc-macro, no runtime vulnerability" and is due for review.
     "RUSTSEC-2024-0436",
     # quick-xml DoS (fixed in 0.41), via object_store's S3 XML parsing. Now
     # reachable through the implemented cold-consumer, but only against our own
@@ -43,7 +46,7 @@ allow = [
     # spacetimedb is Business Source License 1.1 — free under its usage terms;
     # fine for a portfolio project. TODO: review before any commercial use.
     "BUSL-1.1",
-    # bzip2 compression codec (via parquet/datafusion in the api skeleton).
+    # bzip2 compression codec (via parquet/datafusion in the implemented api).
     "bzip2-1.0.6",
 ]
 

@@ -3,27 +3,32 @@
 Real-time crypto market data pipeline (portfolio project, built alongside an
 AI agent).
 
-**Status:** the **ingestor is implemented** — it streams live Binance market
-data (aggTrades, bookTickers, klines) over a combined websocket stream and
-produces enveloped JSON events to per-event-type Redpanda topics, keyed by
-symbol, with jittered-backoff reconnects and graceful shutdown.
+**Status:** every stage is implemented and the pipeline runs end to end,
+exchange to browser, on both paths.
 
-The **hot path is complete, end to end**: the `hot-consumer` reads those topics
-and calls SpacetimeDB reducers to maintain live-state tables (latest trade /
-book ticker / candle per symbol), and the **React frontend subscribes to them
-live** via the SpacetimeDB TS SDK — Binance ticks show up in the browser in real
-time.
+The **ingestor** streams live Binance market data (aggTrades, bookTickers,
+klines) over a combined websocket stream and produces enveloped JSON events to
+per-event-type Redpanda topics, keyed by symbol, with jittered-backoff
+reconnects and graceful shutdown. Sends are pipelined into librdkafka rather
+than awaited per message — see the throughput note in the TODOs for why that
+mattered.
 
-The **cold path is complete too**: the `cold-consumer` batches events into Arrow
-and writes partitioned Parquet to the MinIO lake (deterministic, idempotent
-filenames; offsets committed only after upload), and the `api` crate serves
-historical queries over that lake with **DataFusion** — registering the Parquet
-as tables and answering typed REST endpoints (`/trades`, `/book_tickers`,
-`/klines`).
+The **hot path**: the `hot-consumer` reads those topics and calls SpacetimeDB
+reducers to maintain live-state tables — latest trade, book ticker and current
+candle per symbol, plus a bounded rolling window of `1s` candles — and the
+**React frontend subscribes to them live** via the SpacetimeDB TS SDK, so
+Binance ticks show up in the browser in real time.
 
-The frontend renders **both halves**: live tables pushed from SpacetimeDB, and a
-candlestick chart of history fetched from the api — so the pipeline runs end to
-end, exchange to browser, on both the hot and cold paths.
+The **cold path**: the `cold-consumer` batches events into Arrow and writes
+partitioned Parquet to the MinIO lake (deterministic, idempotent filenames;
+offsets committed only after upload), and the `api` crate serves historical
+queries over that lake with **DataFusion** — registering the Parquet as tables
+and answering typed REST endpoints (`/trades`, `/book_tickers`, `/klines`).
+
+The frontend renders both, and the candlestick chart uses **each path where it
+wins**: `1s` is seeded once from the lake and then followed live over the
+SpacetimeDB subscription, while every coarser interval polls the api. See
+"The live 1s chart" below.
 
 ## Architecture
 
@@ -44,10 +49,12 @@ Binance public websocket
    frontend (React/Vite, Bun) ◀──────REST────── api (Rust, Axum)
 ```
 
-- **Hot path:** latest market state, streamed to the browser via the
-  SpacetimeDB TypeScript SDK.
+- **Hot path:** latest market state — plus a bounded rolling window of `1s`
+  candles — streamed to the browser via the SpacetimeDB TypeScript SDK.
 - **Cold path:** append-only Parquet history on MinIO, queried through the
   Axum API with DataFusion.
+- **The chart uses both:** `1s` seeds from the cold path once and then follows
+  the hot path; coarser intervals are cold path only.
 
 ## Docker strategy
 
@@ -61,7 +68,9 @@ The JS toolchain is **Bun only** — no Node.js, npm, or nvm anywhere.
 
 ## Prerequisites
 
-- Rust stable (`rustup`), plus the wasm target for the SpacetimeDB module:
+- Rust stable (`rustup`) — MSRV is **1.96** (`rust-version` in the workspace
+  `Cargo.toml`); CI builds on stable only, so the MSRV is declared but not yet
+  enforced by a toolchain leg. Plus the wasm target for the SpacetimeDB module:
   `rustup target add wasm32-unknown-unknown`
 - `cmake`, a C compiler, **and a C++ compiler** (rdkafka builds librdkafka
   from source; CMake's toolchain detection needs a C++ compiler even though
@@ -84,9 +93,9 @@ docker compose up -d          # or: make infra-up
 # 2. create the market topics (6 partitions, explicit retention)
 make topics
 
-# 3. rust services
+# 3. rust services (each runs until Ctrl-C — separate terminals)
 cargo run -p ingestor         # streams Binance → Redpanda until Ctrl-C
-make backfill                 # one-shot: REST history for every interval → the lake
+make backfill                 # one-shot: REST history for each configured interval → the lake
 cargo run -p hot-consumer     # market.* topics → SpacetimeDB reducers (needs module published)
 cargo run -p cold-consumer    # market.* topics → batched Parquet on MinIO
 cargo run -p api              # DataFusion over the lake; REST on :8081
@@ -190,6 +199,32 @@ Only 1s is mirrored this way, deliberately — coarser intervals poll the lake
 perfectly well, and keeping hours of them in a live table would defeat the point
 of bounding it.
 
+## Kline intervals (`KLINE_INTERVALS`)
+
+Binance documents 16 intervals. Streaming all of them opens 32 kline streams for
+two symbols and mostly buys waste: every interval except `1s` re-sends its
+forming candle every 2s regardless of how often it actually changes, so a `1M`
+candle costs the same bandwidth as a `1m` one. The real cost isn't the ~5 msg/s
+— it's that each update appends a row to the Parquet lake, and lake size is what
+drives `/klines` scan latency.
+
+Unset, `KLINE_INTERVALS` defaults to `DEFAULT_INTERVALS` in
+`crates/ingestor/src/config.rs` — the documented set minus `3m`/`2h`/`4h`/`8h`/`3d`:
+
+```
+1s  1m  5m  15m  30m  1h  6h  12h  1d  1w  1M
+```
+
+All 16 remain valid; set `KLINE_INTERVALS` to stream any of them. There is no
+`10m`, no `3h`, and a day is `1d` not `24h` — the config rejects anything outside
+Binance's documented set at startup rather than opening a dead stream.
+
+**Two lists must agree.** `INTERVALS` in `frontend/src/lib/intervals.ts` is what
+the chart offers, and it has to match `DEFAULT_INTERVALS`. Nothing checks this at
+build time (one is TypeScript, the other Rust). Offering an interval the ingestor
+doesn't stream renders stale lake history that never updates, with nothing on
+screen explaining why. If you change one, change the other.
+
 ## Testing the ingestor
 
 Ingestor behavior (decode/route/envelope) is tested against **recorded fixtures**,
@@ -233,8 +268,8 @@ crates/
   ingestor/          Binance websocket → Kafka producer (+ REST backfill)   [implemented]
   hot-consumer/      Kafka → SpacetimeDB reducer calls                      [implemented]
   cold-consumer/     Kafka → batched Parquet on MinIO                       [implemented]
-  spacetime-module/  SpacetimeDB server module (wasm)                       [skeleton]
-  api/               Axum + DataFusion historical query API                [implemented]
+  spacetime-module/  SpacetimeDB server module (wasm)                       [implemented]
+  api/               Axum + DataFusion historical query API                 [implemented]
 frontend/            React + TypeScript (Vite), managed with Bun            [implemented]
 ```
 
@@ -243,12 +278,14 @@ frontend/            React + TypeScript (Vite), managed with Bun            [imp
 CI is scoped to what's implemented (`.github/workflows/ci.yml`):
 
 - **rust** — `cargo fmt --check`, `cargo clippy -D warnings`, and
-  `cargo test` across the workspace (skeletons must still compile), plus a
+  `cargo test` across the workspace, plus a
   `wasm32-unknown-unknown` build of `spacetime-module` — `cargo test` only
   host-compiles it, so this verifies its real deployable artifact.
 - **supply-chain** — `cargo deny check` (advisories + licenses + bans +
-  sources). Deferred advisories (from `datafusion` in the `api` skeleton, and
+  sources). Deferred advisories (from `datafusion` via the `api`, and
   `object_store`'s S3 XML parsing) are listed with rationale in `deny.toml`.
+  Those deferrals were taken when `api` was a skeleton; it is implemented now,
+  so they are due for review — see the TODOs.
 - **compose** — `docker compose config` validates `docker-compose.yml`
   (schema/interpolation/service refs) without pulling images or starting
   containers.
@@ -258,7 +295,10 @@ CI is scoped to what's implemented (`.github/workflows/ci.yml`):
 Deferred until the relevant part exists: `cargo-audit` and an MSRV toolchain
 leg. See the workflow footer.
 
-## Known TODOs (marked in code)
+## Known TODOs
+
+Some are marked with `TODO` in the code, most are design notes that only make
+sense at this level. Not a backlog in priority order.
 
 - Hot-consumer delivery: currently commit-after-enqueue with fire-and-forget
   reducer calls (safe for self-healing live-state upserts). A stricter
@@ -309,7 +349,13 @@ leg. See the workflow footer.
   untested.
 - Regenerate SDK bindings with `make module-generate` after module schema
   changes.
-- Revisit the deferred `deny.toml` advisories as `api`/`cold-consumer` are built.
+- **Due now:** the `deny.toml` advisory deferrals were taken while `api` was a
+  skeleton and `cold-consumer` unbuilt. Both are implemented, so the rationale
+  ("only pulled in by the not-yet-implemented `api` skeleton") no longer holds
+  and each deferral needs re-justifying or removing.
+- Undecodable Kafka messages are logged and skipped in both consumers; they
+  should be routed to a `.dlq` topic instead of dropped (marked `TODO` in
+  `crates/cold-consumer/src/lib.rs` and `crates/hot-consumer/src/lib.rs`).
 - Performance metrics: the replay `Stats` and the ingestor currently track only
   correctness counters (events, decode errors) — add throughput (frames/s,
   events/s) and latency (decode time, Kafka produce time) instrumentation, plus

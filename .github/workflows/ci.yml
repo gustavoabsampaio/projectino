@@ -84,5 +84,6 @@ jobs:
 # Deferred until the relevant part of the project exists:
 #   - cargo-audit: cargo-deny's advisory check covers the same RustSec DB for
 #     now; re-add for defense-in-depth when the dependency tree stabilizes.
-#   - MSRV matrix (rust-version in Cargo.toml): re-add a "1.96.1" toolchain leg
-#     once the heavier crates (api/datafusion) are actually built and pinned.
+#   - MSRV matrix (rust-version in Cargo.toml): re-add a "1.96.1" toolchain leg.
+#     This was deferred until the heavier crates (api/datafusion) were actually
+#     built and pinned — as of 2026-07-21 they are, so this is now due.
