@@ -11,6 +11,23 @@ pub const VALID_INTERVALS: &[&str] = &[
     "1M",
 ];
 
+/// Intervals streamed when `KLINE_INTERVALS` is unset.
+///
+/// Deliberately a subset of [`VALID_INTERVALS`]. Streaming all 16 opens 32
+/// kline streams for two symbols and mostly buys waste: every interval except
+/// `1s` re-sends its forming candle every 2s, so a `1M` candle costs the same
+/// bandwidth as a `1m` one while changing meaningfully once a month. The real
+/// cost isn't the ~5 msg/s — it's that every update appends a row to the
+/// Parquet lake, and lake size is what drives `/klines` scan latency.
+///
+/// `3m`/`2h`/`4h`/`8h`/`3d` are dropped as the least-used rungs; each is
+/// adjacent to a neighbour that covers the same use. Anything omitted here is
+/// still fetchable on demand via `make backfill`, and can be re-enabled by
+/// setting `KLINE_INTERVALS`.
+pub const DEFAULT_INTERVALS: &[&str] = &[
+    "1s", "1m", "5m", "15m", "30m", "1h", "6h", "12h", "1d", "1w", "1M",
+];
+
 /// Binance allows at most this many streams on one connection.
 const MAX_STREAMS_PER_CONNECTION: usize = 1024;
 
@@ -39,7 +56,7 @@ impl Config {
 
         // `KLINE_INTERVALS` (plural) is the current setting; the older singular
         // `KLINE_INTERVAL` still works so existing .env files keep running.
-        let default_intervals = VALID_INTERVALS.join(",");
+        let default_intervals = DEFAULT_INTERVALS.join(",");
         let raw = match common::config::optional("KLINE_INTERVALS", "").as_str() {
             "" => common::config::optional("KLINE_INTERVAL", &default_intervals),
             list => list.to_string(),
@@ -160,5 +177,37 @@ mod tests {
             parse_intervals(&VALID_INTERVALS.join(",")).unwrap().len(),
             VALID_INTERVALS.len()
         );
+    }
+
+    #[test]
+    fn default_set_parses() {
+        // The default is what runs when KLINE_INTERVALS is unset, so a typo
+        // here fails at startup for exactly the users who configured nothing.
+        assert_eq!(
+            parse_intervals(&DEFAULT_INTERVALS.join(",")).unwrap().len(),
+            DEFAULT_INTERVALS.len(),
+        );
+    }
+
+    #[test]
+    fn default_set_is_a_subset_of_the_valid_set() {
+        for interval in DEFAULT_INTERVALS {
+            assert!(
+                VALID_INTERVALS.contains(interval),
+                "`{interval}` is in the default set but not a Binance interval"
+            );
+        }
+        assert!(
+            DEFAULT_INTERVALS.len() < VALID_INTERVALS.len(),
+            "the default is meant to be a trimmed subset, not everything"
+        );
+    }
+
+    #[test]
+    fn default_set_keeps_the_intervals_the_rest_of_the_system_assumes() {
+        // `1s` backs the live SpacetimeDB chart and `1m` is the chart default;
+        // dropping either from the default would break those out of the box.
+        assert!(DEFAULT_INTERVALS.contains(&"1s"));
+        assert!(DEFAULT_INTERVALS.contains(&"1m"));
     }
 }
