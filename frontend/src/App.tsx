@@ -1,8 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useSpacetimeDB, useTable } from 'spacetimedb/react';
 import { tables } from './module_bindings';
 import CandleChart from './components/CandleChart';
 import { fetchCandles, type KlineRow } from './lib/api';
+import { fromLiveRow, mergeCandles } from './lib/candles';
 import { INTERVALS, refreshLabel, refreshPeriodMs } from './lib/intervals';
 
 const SYMBOLS = ['BTCUSDT', 'ETHUSDT'];
@@ -13,6 +14,13 @@ const SYMBOLS = ['BTCUSDT', 'ETHUSDT'];
  * request would freeze the chart permanently.
  */
 const REQUEST_TIMEOUT_MS = 20_000;
+
+/**
+ * The one interval served live from SpacetimeDB rather than by polling the
+ * lake. Must match the interval the hot-consumer mirrors into the module's
+ * rolling window (`INTERVAL_1S` in `crates/hot-consumer/src/translate.rs`).
+ */
+const LIVE_INTERVAL = '1s';
 
 /** Sort a copy of the rows by symbol for stable rendering. */
 function bySymbol<T extends { symbol: string }>(rows: readonly T[]): T[] {
@@ -113,13 +121,38 @@ function Live() {
   );
 }
 
-/** History: fetched from the Axum + DataFusion api over the Parquet lake. */
+/**
+ * History from the Axum + DataFusion api over the Parquet lake — except at 1s,
+ * which is a hybrid: seeded from the lake once, then followed live over the
+ * SpacetimeDB subscription. See `lib/candles.ts` for why.
+ */
 function History() {
   const [symbol, setSymbol] = useState('BTCUSDT');
   const [barInterval, setBarInterval] = useState('1m');
-  const [candles, setCandles] = useState<KlineRow[]>([]);
+  const [seeded, setSeeded] = useState<KlineRow[]>([]);
   const [state, setState] = useState<'loading' | 'ready' | 'error'>('loading');
   const [error, setError] = useState('');
+
+  // At 1s the chart follows the module's rolling window instead of polling.
+  // The subscription is always open — the table is bounded to ~10 minutes per
+  // symbol, so it costs little to hold — and simply goes unused at coarser
+  // intervals, which the lake serves perfectly well on its own.
+  const isLive = barInterval === LIVE_INTERVAL;
+  const [liveRows] = useTable(tables.live_kline_second);
+
+  const candles = useMemo(() => {
+    if (!isLive) return seeded;
+    const live = liveRows.filter((row) => row.symbol === symbol).map(fromLiveRow);
+    return mergeCandles(seeded, live);
+  }, [isLive, seeded, liveRows, symbol]);
+
+  // At 1s the freshness that matters is the newest candle's own timestamp, not
+  // when the seed request landed — that would sit there going stale while the
+  // chart was in fact updating every second.
+  const liveUpdatedAt = useMemo(
+    () => (isLive && candles.length > 0 ? new Date(candles[candles.length - 1].open_time) : null),
+    [isLive, candles],
+  );
 
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
   // Bumping this re-runs the effect below — that's the manual refresh.
@@ -163,7 +196,7 @@ function History() {
       try {
         const rows = await fetchCandles(symbol, barInterval, { signal: controller.signal });
         if (cancelled) return;
-        setCandles(rows);
+        setSeeded(rows);
         setState('ready');
         setUpdatedAt(new Date());
       } catch (err) {
@@ -183,8 +216,10 @@ function History() {
         firstLoad = false;
         inFlight = null;
         // Re-arm even after an error, so the chart recovers on its own once the
-        // api is healthy again.
-        if (!cancelled) {
+        // api is healthy again — but not at 1s, where this request is a
+        // one-shot seed and the subscription takes over from here. Re-arming
+        // there is exactly the polling this interval was moved off.
+        if (!cancelled && !isLive) {
           timer = window.setTimeout(() => void run(), refreshPeriodMs(barInterval));
         }
       }
@@ -196,7 +231,7 @@ function History() {
       inFlight?.abort();
       window.clearTimeout(timer);
     };
-  }, [symbol, barInterval, reloadToken]);
+  }, [symbol, barInterval, reloadToken, isLive]);
 
   return (
     <section>
@@ -229,8 +264,10 @@ function History() {
           refresh
         </button>
         <span className="muted">
-          auto {refreshLabel(barInterval)}
-          {updatedAt && ` · updated ${updatedAt.toLocaleTimeString()}`}
+          {isLive ? 'live · pushed from spacetimedb' : `auto ${refreshLabel(barInterval)}`}
+          {isLive
+            ? liveUpdatedAt && ` · candle ${liveUpdatedAt.toLocaleTimeString()}`
+            : updatedAt && ` · updated ${updatedAt.toLocaleTimeString()}`}
           {state === 'loading' && ' · loading…'}
         </span>
       </div>

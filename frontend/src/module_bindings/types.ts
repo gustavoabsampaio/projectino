@@ -37,6 +37,22 @@ export const LiveKline = __t.object("LiveKline", {
 });
 export type LiveKline = __Infer<typeof LiveKline>;
 
+export const LiveKlineSecond = __t.object("LiveKlineSecond", {
+  id: __t.string(),
+  symbol: __t.string(),
+  open: __t.string(),
+  high: __t.string(),
+  low: __t.string(),
+  close: __t.string(),
+  volume: __t.string(),
+  quoteVolume: __t.string(),
+  tradeCount: __t.i64(),
+  openTime: __t.i64(),
+  closeTime: __t.i64(),
+  isClosed: __t.bool(),
+});
+export type LiveKlineSecond = __Infer<typeof LiveKlineSecond>;
+
 export const LiveTrade = __t.object("LiveTrade", {
   symbol: __t.string(),
   price: __t.string(),

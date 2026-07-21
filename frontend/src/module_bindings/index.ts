@@ -36,6 +36,7 @@ import {
 // Import all reducer arg schemas
 import RecordBookTickerReducer from "./record_book_ticker_reducer";
 import RecordKlineReducer from "./record_kline_reducer";
+import RecordKlineSecondReducer from "./record_kline_second_reducer";
 import RecordTradeReducer from "./record_trade_reducer";
 
 // Import all procedure arg schemas
@@ -43,6 +44,7 @@ import RecordTradeReducer from "./record_trade_reducer";
 // Import all table schema definitions
 import LiveBookTickerRow from "./live_book_ticker_table";
 import LiveKlineRow from "./live_kline_table";
+import LiveKlineSecondRow from "./live_kline_second_table";
 import LiveTradeRow from "./live_trade_table";
 
 /** Type-only namespace exports for generated type groups. */
@@ -74,6 +76,20 @@ const tablesSchema = __schema({
       { name: 'live_kline_id_key', constraint: 'unique', columns: ['id'] },
     ],
   }, LiveKlineRow),
+  live_kline_second: __table({
+    name: 'live_kline_second',
+    indexes: [
+      { accessor: 'id', name: 'live_kline_second_id_idx_btree', algorithm: 'btree', columns: [
+        'id',
+      ] },
+      { accessor: 'symbol', name: 'live_kline_second_symbol_idx_btree', algorithm: 'btree', columns: [
+        'symbol',
+      ] },
+    ],
+    constraints: [
+      { name: 'live_kline_second_id_key', constraint: 'unique', columns: ['id'] },
+    ],
+  }, LiveKlineSecondRow),
   live_trade: __table({
     name: 'live_trade',
     indexes: [
@@ -91,6 +107,7 @@ const tablesSchema = __schema({
 const reducersSchema = __reducers(
   __reducerSchema("record_book_ticker", RecordBookTickerReducer),
   __reducerSchema("record_kline", RecordKlineReducer),
+  __reducerSchema("record_kline_second", RecordKlineSecondReducer),
   __reducerSchema("record_trade", RecordTradeReducer),
 );
 

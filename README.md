@@ -115,7 +115,8 @@ bun run dev                   # http://localhost:5173
 | Lake files (cold path) | run `cold-consumer`, then browse http://localhost:9001 → bucket `market-lake` (Parquet under `market.trades/partition=…/`) |
 | Axum API (health) | `curl http://localhost:8081/health` → `{"status":"ok"}` |
 | History query (cold path) | `curl "http://localhost:8081/trades?symbol=BTCUSDT&limit=5"` (also `/book_tickers`, `/klines?symbol=…&interval=1m`) |
-| Frontend | http://localhost:5173 — live tables (hot path) + candlestick chart (cold path). Needs the `api` running for history; pick `1s` for a chart that fills in seconds |
+| Live 1s window | `spacetime sql --server http://localhost:3000 projectino "SELECT COUNT(*) AS n FROM live_kline_second"` (needs ingestor + hot-consumer; aggregates require an alias) |
+| Frontend | http://localhost:5173 — live tables (hot path) + candlestick chart (cold path). Needs the `api` running for history; `1s` additionally needs ingestor + hot-consumer, and updates once a second |
 
 ## Listing freshness (`API_LISTING_TTL_MS`)
 
@@ -152,12 +153,42 @@ So the listing costs ~0.9s and the Parquet scan ~1.1s. Two things follow:
   running. Treat it as withdrawn.
 - **The TTL alone does not fix the 1s chart.** A cached response still takes
   ~1.1s, which is longer than the 1s poll period, so responses would still be
-  superseded. The frontend also skips a poll while one is in flight, and *that*
-  is what makes the chart render; the TTL keeps it from falling further behind.
-  Both halves are load-bearing. In practice the 1s chart now refreshes every
-  ~2–3s rather than every 1s — honest behaviour under a slow api, instead of a
-  spinner forever. Getting it to a true 1s refresh needs the scan itself to get
-  cheaper (api-side aggregation — see the TODOs).
+  superseded. The self-scheduling poll is what makes it render; the TTL keeps it
+  from falling further behind. That got 1s to ~2–3s per refresh — honest
+  behaviour under a slow api rather than a spinner forever, but still not 1s.
+  Polling was the wrong shape for this interval, which is what the live path
+  below replaces it with.
+
+## The live 1s chart (hot path)
+
+Every interval except `1s` is served by polling the lake through the api. `1s`
+is a hybrid, because ~1.1s is the *floor* for a lake query and the chart wants a
+new candle every second — polling can never win that race.
+
+Instead:
+
+1. **Seed** — one `/klines?interval=1s` request on load, for deep history.
+2. **Follow** — a SpacetimeDB subscription to `live_kline_second`, a rolling
+   window of 1s candles fed by the hot path (ingestor → Redpanda →
+   hot-consumer → `record_kline_second`). Push, not poll.
+3. **Merge** — the two overlap; same `open_time` means the same candle and the
+   live copy wins (`frontend/src/lib/candles.ts`).
+
+Measured 2026-07-21: **10 chart updates in 10s** (one per second), against
+~2–3s when polling. Network shows exactly one `/klines` request per load and
+none after — the polling is genuinely gone, not just faster.
+
+`live_kline_second` is the only append-shaped table in the module, so unlike the
+upsert live-state tables it needs explicit bounding: `WINDOW_1S` (600 candles,
+~10 min per symbol) with a slack margin so the trim's table scan is amortized
+over many inserts rather than paid on every one. Deep history stays in the lake;
+this window only has to cover the gap since a client loaded. Verified by
+temporarily shrinking the window and watching the row count oscillate under the
+cap instead of growing.
+
+Only 1s is mirrored this way, deliberately — coarser intervals poll the lake
+perfectly well, and keeping hours of them in a live table would defeat the point
+of bounding it.
 
 ## Testing the ingestor
 
@@ -244,9 +275,15 @@ leg. See the workflow footer.
   schema so price aggregations don't need a cast.
 - Lake listing is cached behind `API_LISTING_TTL_MS` (default 3s) rather than
   re-listed per request — see "Listing freshness" above. The remaining ~1.1s per
-  query is the Parquet scan itself, which still keeps the 1s chart from truly
-  refreshing at 1s (it manages ~2–3s). The api-side "latest per open_time"
-  aggregation in the frontend note above is the next lever.
+  query is the Parquet scan itself. `1s` no longer polls at all (see "The live
+  1s chart"), but every other interval still pays that scan; the api-side
+  "latest per open_time" aggregation in the frontend note above is the next
+  lever for those.
+- The live 1s window is seeded per *client*, from the lake, on every page load.
+  A client that stays open longer than `WINDOW_1S` (~10 min) and then loses its
+  websocket could have a gap between what the window still holds and what the
+  lake has flushed. Not observed, and a reconnect re-seeds — but the seam is
+  untested.
 - Regenerate SDK bindings with `make module-generate` after module schema
   changes.
 - Revisit the deferred `deny.toml` advisories as `api`/`cold-consumer` are built.

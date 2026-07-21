@@ -8,7 +8,7 @@
 // quiet stretch expands it rather than squashing it against the full range.
 
 import { useMemo, useRef, useState } from 'react';
-import type { KlineRow } from '../lib/api';
+import type { Candle } from '../lib/candles';
 
 const WIDTH = 760;
 const HEIGHT = 300;
@@ -59,7 +59,7 @@ export default function CandleChart({
   candles,
   interval,
 }: {
-  candles: KlineRow[];
+  candles: Candle[];
   interval: string;
 }) {
   const svgRef = useRef<SVGSVGElement>(null);
@@ -72,7 +72,7 @@ export default function CandleChart({
 
   // Resolve the visible window, clamped to the data we actually have.
   const { start, visible } = useMemo(() => {
-    if (total === 0) return { start: 0, visible: [] as KlineRow[] };
+    if (total === 0) return { start: 0, visible: [] as Candle[] };
     const count = Math.max(MIN_VISIBLE, Math.min(view?.count ?? DEFAULT_VISIBLE, total));
     const maxStart = Math.max(0, total - count);
     const s = Math.max(0, Math.min(view?.start ?? maxStart, maxStart));
@@ -278,7 +278,7 @@ export default function CandleChart({
 }
 
 /** OHLCV readout pinned near the hovered candle. */
-function Tooltip({ candle, x }: { candle: KlineRow; x: number }) {
+function Tooltip({ candle, x }: { candle: Candle; x: number }) {
   const lines = [
     formatFullTime(candle.open_time),
     `O ${candle.open}`,
