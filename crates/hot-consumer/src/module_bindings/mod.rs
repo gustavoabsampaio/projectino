@@ -8,22 +8,28 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
 pub mod live_book_ticker_table;
 pub mod live_book_ticker_type;
+pub mod live_kline_second_table;
+pub mod live_kline_second_type;
 pub mod live_kline_table;
 pub mod live_kline_type;
 pub mod live_trade_table;
 pub mod live_trade_type;
 pub mod record_book_ticker_reducer;
 pub mod record_kline_reducer;
+pub mod record_kline_second_reducer;
 pub mod record_trade_reducer;
 
 pub use live_book_ticker_table::*;
 pub use live_book_ticker_type::LiveBookTicker;
+pub use live_kline_second_table::*;
+pub use live_kline_second_type::LiveKlineSecond;
 pub use live_kline_table::*;
 pub use live_kline_type::LiveKline;
 pub use live_trade_table::*;
 pub use live_trade_type::LiveTrade;
 pub use record_book_ticker_reducer::record_book_ticker;
 pub use record_kline_reducer::record_kline;
+pub use record_kline_second_reducer::record_kline_second;
 pub use record_trade_reducer::record_trade;
 
 #[derive(Clone, PartialEq, Debug)]
@@ -56,6 +62,19 @@ pub enum Reducer {
         close_time: i64,
         is_closed: bool,
     },
+    RecordKlineSecond {
+        symbol: String,
+        open: String,
+        high: String,
+        low: String,
+        close: String,
+        volume: String,
+        quote_volume: String,
+        trade_count: i64,
+        open_time: i64,
+        close_time: i64,
+        is_closed: bool,
+    },
     RecordTrade {
         symbol: String,
         price: String,
@@ -75,6 +94,7 @@ impl __sdk::Reducer for Reducer {
         match self {
             Reducer::RecordBookTicker { .. } => "record_book_ticker",
             Reducer::RecordKline { .. } => "record_kline",
+            Reducer::RecordKlineSecond { .. } => "record_kline_second",
             Reducer::RecordTrade { .. } => "record_trade",
             _ => unreachable!(),
         }
@@ -124,6 +144,31 @@ impl __sdk::Reducer for Reducer {
                 close_time: close_time.clone(),
                 is_closed: is_closed.clone(),
             }),
+            Reducer::RecordKlineSecond {
+                symbol,
+                open,
+                high,
+                low,
+                close,
+                volume,
+                quote_volume,
+                trade_count,
+                open_time,
+                close_time,
+                is_closed,
+            } => __sats::bsatn::to_vec(&record_kline_second_reducer::RecordKlineSecondArgs {
+                symbol: symbol.clone(),
+                open: open.clone(),
+                high: high.clone(),
+                low: low.clone(),
+                close: close.clone(),
+                volume: volume.clone(),
+                quote_volume: quote_volume.clone(),
+                trade_count: trade_count.clone(),
+                open_time: open_time.clone(),
+                close_time: close_time.clone(),
+                is_closed: is_closed.clone(),
+            }),
             Reducer::RecordTrade {
                 symbol,
                 price,
@@ -150,6 +195,7 @@ impl __sdk::Reducer for Reducer {
 pub struct DbUpdate {
     live_book_ticker: __sdk::TableUpdate<LiveBookTicker>,
     live_kline: __sdk::TableUpdate<LiveKline>,
+    live_kline_second: __sdk::TableUpdate<LiveKlineSecond>,
     live_trade: __sdk::TableUpdate<LiveTrade>,
 }
 
@@ -165,6 +211,9 @@ impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
                 "live_kline" => db_update
                     .live_kline
                     .append(live_kline_table::parse_table_update(table_update)?),
+                "live_kline_second" => db_update
+                    .live_kline_second
+                    .append(live_kline_second_table::parse_table_update(table_update)?),
                 "live_trade" => db_update
                     .live_trade
                     .append(live_trade_table::parse_table_update(table_update)?),
@@ -200,6 +249,9 @@ impl __sdk::DbUpdate for DbUpdate {
         diff.live_kline = cache
             .apply_diff_to_table::<LiveKline>("live_kline", &self.live_kline)
             .with_updates_by_pk(|row| &row.id);
+        diff.live_kline_second = cache
+            .apply_diff_to_table::<LiveKlineSecond>("live_kline_second", &self.live_kline_second)
+            .with_updates_by_pk(|row| &row.id);
         diff.live_trade = cache
             .apply_diff_to_table::<LiveTrade>("live_trade", &self.live_trade)
             .with_updates_by_pk(|row| &row.symbol);
@@ -215,6 +267,9 @@ impl __sdk::DbUpdate for DbUpdate {
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "live_kline" => db_update
                     .live_kline
+                    .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
+                "live_kline_second" => db_update
+                    .live_kline_second
                     .append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "live_trade" => db_update
                     .live_trade
@@ -238,6 +293,9 @@ impl __sdk::DbUpdate for DbUpdate {
                 "live_kline" => db_update
                     .live_kline
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
+                "live_kline_second" => db_update
+                    .live_kline_second
+                    .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
                 "live_trade" => db_update
                     .live_trade
                     .append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
@@ -258,6 +316,7 @@ impl __sdk::DbUpdate for DbUpdate {
 pub struct AppliedDiff<'r> {
     live_book_ticker: __sdk::TableAppliedDiff<'r, LiveBookTicker>,
     live_kline: __sdk::TableAppliedDiff<'r, LiveKline>,
+    live_kline_second: __sdk::TableAppliedDiff<'r, LiveKlineSecond>,
     live_trade: __sdk::TableAppliedDiff<'r, LiveTrade>,
     __unused: std::marker::PhantomData<&'r ()>,
 }
@@ -278,6 +337,11 @@ impl<'r> __sdk::AppliedDiff<'r> for AppliedDiff<'r> {
             event,
         );
         callbacks.invoke_table_row_callbacks::<LiveKline>("live_kline", &self.live_kline, event);
+        callbacks.invoke_table_row_callbacks::<LiveKlineSecond>(
+            "live_kline_second",
+            &self.live_kline_second,
+            event,
+        );
         callbacks.invoke_table_row_callbacks::<LiveTrade>("live_trade", &self.live_trade, event);
     }
 }
@@ -941,8 +1005,13 @@ impl __sdk::SpacetimeModule for RemoteModule {
     fn register_tables(client_cache: &mut __sdk::ClientCache<Self>) {
         live_book_ticker_table::register_table(client_cache);
         live_kline_table::register_table(client_cache);
+        live_kline_second_table::register_table(client_cache);
         live_trade_table::register_table(client_cache);
     }
-    const ALL_TABLE_NAMES: &'static [&'static str] =
-        &["live_book_ticker", "live_kline", "live_trade"];
+    const ALL_TABLE_NAMES: &'static [&'static str] = &[
+        "live_book_ticker",
+        "live_kline",
+        "live_kline_second",
+        "live_trade",
+    ];
 }

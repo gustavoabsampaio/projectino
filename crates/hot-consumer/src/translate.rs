@@ -13,7 +13,13 @@ use anyhow::{Context, Result, bail};
 use common::events::{AggTrade, BookTicker, KlineEvent};
 use serde::Deserialize;
 
-use crate::module_bindings::{DbConnection, record_book_ticker, record_kline, record_trade};
+use crate::module_bindings::{
+    DbConnection, record_book_ticker, record_kline, record_kline_second, record_trade,
+};
+
+/// The one interval mirrored into the module's rolling window — see
+/// `LiveKlineSecond` in the spacetime-module for why only this one.
+const INTERVAL_1S: &str = "1s";
 
 /// A fully-decoded reducer invocation, with prices already converted to the
 /// exact strings the module expects. Field order matches the reducer arguments.
@@ -178,23 +184,46 @@ pub fn dispatch(conn: &DbConnection, bytes: &[u8]) -> Result<&'static str> {
             open_time,
             close_time,
             is_closed,
-        } => conn
-            .reducers
-            .record_kline(
-                symbol,
-                interval,
-                open,
-                high,
-                low,
-                close,
-                volume,
-                quote_volume,
-                trade_count,
-                open_time,
-                close_time,
-                is_closed,
-            )
-            .map_err(|e| anyhow::anyhow!("record_kline call failed: {e}"))?,
+        } => {
+            // 1s candles additionally feed the rolling window that backs the
+            // live 1s chart. Every interval — 1s included — still upserts the
+            // current-candle table; the two serve different readers, so this
+            // is deliberately two calls rather than one. Only 1s pays the
+            // clone.
+            if interval == INTERVAL_1S {
+                conn.reducers
+                    .record_kline_second(
+                        symbol.clone(),
+                        open.clone(),
+                        high.clone(),
+                        low.clone(),
+                        close.clone(),
+                        volume.clone(),
+                        quote_volume.clone(),
+                        trade_count,
+                        open_time,
+                        close_time,
+                        is_closed,
+                    )
+                    .map_err(|e| anyhow::anyhow!("record_kline_second call failed: {e}"))?;
+            }
+            conn.reducers
+                .record_kline(
+                    symbol,
+                    interval,
+                    open,
+                    high,
+                    low,
+                    close,
+                    volume,
+                    quote_volume,
+                    trade_count,
+                    open_time,
+                    close_time,
+                    is_closed,
+                )
+                .map_err(|e| anyhow::anyhow!("record_kline call failed: {e}"))?;
+        }
     }
     Ok(kind)
 }

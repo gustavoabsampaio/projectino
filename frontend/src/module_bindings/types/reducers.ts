@@ -8,9 +8,11 @@ import { type Infer as __Infer } from "spacetimedb";
 // Import all reducer arg schemas
 import RecordBookTickerReducer from "../record_book_ticker_reducer";
 import RecordKlineReducer from "../record_kline_reducer";
+import RecordKlineSecondReducer from "../record_kline_second_reducer";
 import RecordTradeReducer from "../record_trade_reducer";
 
 export type RecordBookTickerParams = __Infer<typeof RecordBookTickerReducer>;
 export type RecordKlineParams = __Infer<typeof RecordKlineReducer>;
+export type RecordKlineSecondParams = __Infer<typeof RecordKlineSecondReducer>;
 export type RecordTradeParams = __Infer<typeof RecordTradeReducer>;
 
