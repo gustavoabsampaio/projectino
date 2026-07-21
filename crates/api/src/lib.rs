@@ -8,7 +8,9 @@
 
 pub mod config;
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use arrow::array::RecordBatch;
@@ -21,6 +23,7 @@ use axum::{Json, Router};
 use datafusion::prelude::*;
 use object_store::aws::AmazonS3Builder;
 use serde::Deserialize;
+use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use tracing::{debug, info, warn};
 use url::Url;
@@ -50,12 +53,20 @@ fn lake_tables() -> [(&'static str, &'static str); 3] {
 struct AppState {
     ctx: SessionContext,
     cfg: Config,
+    /// When each table's file listing was last refreshed, `None` if it has
+    /// never registered successfully. Keys are fixed at startup (one per
+    /// [`lake_tables`] entry), so the map itself never needs locking.
+    ///
+    /// The per-table `Mutex` is held across the refresh, which also collapses
+    /// concurrent requests for the same table onto a single re-listing instead
+    /// of each starting its own.
+    refreshed: HashMap<&'static str, Mutex<Option<Instant>>>,
 }
 
 type SharedState = Arc<AppState>;
 
 pub async fn run(cfg: Config) -> Result<()> {
-    let ctx = build_context(&cfg).await?;
+    let state = build_state(cfg.clone()).await?;
 
     // The browser frontend runs on a different port, so it needs CORS. Scoped
     // to one configured origin (not wide open) and read-only methods.
@@ -73,10 +84,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         .route("/book_tickers", get(book_tickers))
         .route("/klines", get(klines))
         .layer(cors)
-        .with_state(Arc::new(AppState {
-            ctx,
-            cfg: cfg.clone(),
-        }));
+        .with_state(Arc::new(state));
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen_addr)
         .await
@@ -86,8 +94,9 @@ pub async fn run(cfg: Config) -> Result<()> {
     Ok(())
 }
 
-/// Build a SessionContext with the MinIO object store and lake tables.
-async fn build_context(cfg: &Config) -> Result<SessionContext> {
+/// Build the handler state: a SessionContext with the MinIO object store and
+/// the lake tables registered.
+async fn build_state(cfg: Config) -> Result<AppState> {
     let ctx = SessionContext::new();
 
     // `allow_http` is required because local MinIO serves plain HTTP.
@@ -106,18 +115,32 @@ async fn build_context(cfg: &Config) -> Result<SessionContext> {
     ctx.register_object_store(&url, Arc::new(store));
 
     // One Parquet table per topic. A table with no data yet simply fails to
-    // register here; queries refresh the registration anyway (see below).
+    // register here; queries refresh the registration anyway (see below), and
+    // a `None` timestamp makes the next query retry immediately.
+    let mut refreshed = HashMap::new();
     for (name, topic) in lake_tables() {
-        match register_table(&ctx, name, topic, cfg).await {
-            Ok(()) => info!(table = name, "registered lake table"),
-            Err(error) => warn!(
-                table = name,
-                error = %error,
-                "table not registered yet — no data in the lake? it will register on first query once the cold-consumer writes"
-            ),
-        }
+        let at = match register_table(&ctx, name, topic, &cfg).await {
+            Ok(()) => {
+                info!(table = name, "registered lake table");
+                Some(Instant::now())
+            }
+            Err(error) => {
+                warn!(
+                    table = name,
+                    error = %error,
+                    "table not registered yet — no data in the lake? it will register on first query once the cold-consumer writes"
+                );
+                None
+            }
+        };
+        refreshed.insert(name, Mutex::new(at));
     }
-    Ok(ctx)
+
+    Ok(AppState {
+        ctx,
+        cfg,
+        refreshed,
+    })
 }
 
 /// (Re)register a Parquet table over its lake prefix.
@@ -135,17 +158,48 @@ async fn register_table(ctx: &SessionContext, name: &str, topic: &str, cfg: &Con
         .with_context(|| format!("registering {name} from {path}"))
 }
 
-/// Refresh the table registration so newly written Parquet is visible, then
-/// return a DataFrame over it.
+/// Is a listing last refreshed at `last` due for a refresh?
+fn is_stale(last: Option<Instant>, ttl: Duration) -> bool {
+    // Never registered → always due, so an empty lake picks up its first
+    // Parquet as soon as the cold-consumer writes it.
+    last.is_none_or(|at| at.elapsed() >= ttl)
+}
+
+/// Refresh the table registration if its listing has gone stale, so newly
+/// written Parquet becomes visible, then return a DataFrame over it.
 ///
-/// This re-lists the lake prefix on every request — the simple, always-fresh
-/// choice at this scale. If the lake grows large, cache the listing behind a
-/// short TTL instead.
-async fn fresh_table(state: &AppState, name: &str, topic: &str) -> Result<DataFrame, AppError> {
-    if let Err(error) = register_table(&state.ctx, name, topic, &state.cfg).await {
-        // Don't fail a table that is already registered just because a refresh
-        // hiccuped; fall through to whatever registration we have.
-        debug!(table = name, error = %format!("{error:#}"), "table refresh failed");
+/// Re-listing costs a full `LIST` over the lake prefix, which grows with the
+/// lake (measured: ~5–7s at 1,611 files). Doing that per request made any
+/// client polling faster than the response time — the 1s chart — never see a
+/// response that wasn't already superseded. The TTL caps re-listing at once
+/// per `listing_ttl` no matter the request rate, so a fast poller mostly hits
+/// the cached listing and pays only for the query.
+async fn fresh_table(
+    state: &AppState,
+    name: &'static str,
+    topic: &str,
+) -> Result<DataFrame, AppError> {
+    match state.refreshed.get(name) {
+        Some(cell) => {
+            let mut last = cell.lock().await;
+            // Re-checked under the lock: while we waited, another request may
+            // have just refreshed this table, and then there's nothing to do.
+            if is_stale(*last, state.cfg.listing_ttl) {
+                match register_table(&state.ctx, name, topic, &state.cfg).await {
+                    Ok(()) => *last = Some(Instant::now()),
+                    // Don't fail a table that is already registered just
+                    // because a refresh hiccuped; fall through to whatever
+                    // registration we have, and leave the timestamp alone so
+                    // the next request retries.
+                    Err(error) => {
+                        debug!(table = name, error = %format!("{error:#}"), "table refresh failed");
+                    }
+                }
+            }
+        }
+        // Unreachable while every caller passes a `lake_tables()` name, but a
+        // missing entry shouldn't silently serve an unrefreshed table.
+        None => warn!(table = name, "no refresh entry for table"),
     }
     Ok(state.ctx.table(name).await?)
 }
@@ -284,6 +338,37 @@ mod tests {
         assert_eq!(clamp_limit(Some(10)), 10);
         assert_eq!(clamp_limit(Some(0)), 1);
         assert_eq!(clamp_limit(Some(5_000)), MAX_LIMIT);
+    }
+
+    #[test]
+    fn a_listing_that_never_registered_is_always_stale() {
+        assert!(is_stale(None, Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn a_listing_is_stale_only_once_the_ttl_has_elapsed() {
+        let now = Instant::now();
+        assert!(!is_stale(Some(now), Duration::from_secs(3)));
+        // A TTL of zero means "refresh every time", i.e. the old behaviour.
+        assert!(is_stale(Some(now), Duration::ZERO));
+        assert!(is_stale(
+            now.checked_sub(Duration::from_secs(5)),
+            Duration::from_secs(3)
+        ));
+    }
+
+    #[test]
+    fn every_lake_table_gets_a_refresh_entry() {
+        // `fresh_table` can only refresh tables present in the map, so the two
+        // must not drift apart as tables are added.
+        let refreshed: HashMap<_, _> = lake_tables()
+            .into_iter()
+            .map(|(name, _)| (name, Mutex::new(None::<Instant>)))
+            .collect();
+        assert_eq!(refreshed.len(), lake_tables().len());
+        for (name, _) in lake_tables() {
+            assert!(refreshed.contains_key(name), "no refresh entry for {name}");
+        }
     }
 
     #[test]

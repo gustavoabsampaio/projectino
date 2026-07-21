@@ -117,6 +117,48 @@ bun run dev                   # http://localhost:5173
 | History query (cold path) | `curl "http://localhost:8081/trades?symbol=BTCUSDT&limit=5"` (also `/book_tickers`, `/klines?symbol=…&interval=1m`) |
 | Frontend | http://localhost:5173 — live tables (hot path) + candlestick chart (cold path). Needs the `api` running for history; pick `1s` for a chart that fills in seconds |
 
+## Listing freshness (`API_LISTING_TTL_MS`)
+
+DataFusion resolves a table's set of Parquet files when the table is
+*registered*, so a long-running api would otherwise never see files the
+cold-consumer wrote after startup. The api therefore re-registers a table
+before querying it — but that re-listing is a full `LIST` over the lake prefix,
+and it grows with the lake.
+
+Doing that per request broke any client polling faster than the response time:
+the 1s chart's every response was superseded by the next request before it
+landed, the frontend's stale-response guard correctly discarded it, and the
+chart never rendered. Slower intervals were unaffected.
+
+Now the listing is reused for `API_LISTING_TTL_MS` (default 3000). That bounds
+how stale a query's view of the lake can be, and caps re-listing at once per
+TTL however fast clients poll. Set it to `0` to re-list on every request.
+Concurrent requests for the same table share one refresh rather than each
+starting their own.
+
+**Measured 2026-07-21** (`/klines?interval=1s&limit=200`, idle machine, lake
+larger than the original repro; only the api running):
+
+| | per request |
+|---|---|
+| `API_LISTING_TTL_MS=0` (re-list every time) | ~2.0s |
+| listing cached (TTL not yet expired) | ~1.1s |
+
+So the listing costs ~0.9s and the Parquet scan ~1.1s. Two things follow:
+
+- An earlier note in this README put the per-request cost at 5–7s at 1,611
+  files. It measures ~2.0s now on a *larger* lake, so that figure was probably
+  inflated by contention — it was taken with the ingestor and cold-consumer
+  running. Treat it as withdrawn.
+- **The TTL alone does not fix the 1s chart.** A cached response still takes
+  ~1.1s, which is longer than the 1s poll period, so responses would still be
+  superseded. The frontend also skips a poll while one is in flight, and *that*
+  is what makes the chart render; the TTL keeps it from falling further behind.
+  Both halves are load-bearing. In practice the 1s chart now refreshes every
+  ~2–3s rather than every 1s — honest behaviour under a slow api, instead of a
+  spinner forever. Getting it to a true 1s refresh needs the scan itself to get
+  cheaper (api-side aggregation — see the TODOs).
+
 ## Testing the ingestor
 
 Ingestor behavior (decode/route/envelope) is tested against **recorded fixtures**,
@@ -200,19 +242,11 @@ leg. See the workflow footer.
   per interval.
 - API refinements: pagination / time-range filters, and a `Decimal128` lake
   schema so price aggregations don't need a cast.
-- **BROKEN: the `1s` chart interval never loads.** Root cause measured
-  2026-07-20: `/klines` takes ~5–7s per request because the api re-lists the
-  whole lake prefix (1,611 Parquet files) on every call to stay fresh, while
-  the 1s chart polls every 1s. Each response is superseded by a newer request
-  before it lands, and the frontend's stale-response guard correctly discards
-  it — so nothing ever renders. Every other interval works (their poll periods
-  exceed the response time). Two fixes, either of which unblocks it:
-  1. Cache the DataFusion table listing behind a short TTL (say 2–5s) instead
-     of re-registering per request — this is the real fix and also removes the
-     per-request listing cost as the lake grows.
-  2. Skip a poll while one is still in flight (and/or back the poll period off
-     to the observed latency), so a slow api degrades to slower refreshes
-     rather than none.
+- Lake listing is cached behind `API_LISTING_TTL_MS` (default 3s) rather than
+  re-listed per request — see "Listing freshness" above. The remaining ~1.1s per
+  query is the Parquet scan itself, which still keeps the 1s chart from truly
+  refreshing at 1s (it manages ~2–3s). The api-side "latest per open_time"
+  aggregation in the frontend note above is the next lever.
 - Regenerate SDK bindings with `make module-generate` after module schema
   changes.
 - Revisit the deferred `deny.toml` advisories as `api`/`cold-consumer` are built.

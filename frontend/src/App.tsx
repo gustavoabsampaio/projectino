@@ -7,6 +7,13 @@ import { INTERVALS, refreshLabel, refreshPeriodMs } from './lib/intervals';
 
 const SYMBOLS = ['BTCUSDT', 'ETHUSDT'];
 
+/**
+ * Hard deadline on a single history request. Generous next to the observed ~2s
+ * response, but bounded — see the poll loop in `History` for why an unbounded
+ * request would freeze the chart permanently.
+ */
+const REQUEST_TIMEOUT_MS = 20_000;
+
 /** Sort a copy of the rows by symbol for stable rendering. */
 function bySymbol<T extends { symbol: string }>(rows: readonly T[]): T[] {
   return [...rows].sort((a, b) => a.symbol.localeCompare(b.symbol));
@@ -118,46 +125,76 @@ function History() {
   // Bumping this re-runs the effect below — that's the manual refresh.
   const [reloadToken, setReloadToken] = useState(0);
 
-  // Load on selection change, then poll at the candle's own cadence:
-  // 1s → every 1s, 1h → every 1h, capped at 24h (setInterval's 32-bit limit).
+  // Load on selection change, then re-poll at the candle's own cadence:
+  // 1s → every 1s, 1h → every 1h, capped at 24h.
   //
-  // Two guards keep a stale response from winning:
-  //  - `cancelled` + `abort` — when the selection changes, a request that was
-  //    already in flight (very likely at 1s) must not overwrite the new
-  //    interval's data when it lands.
-  //  - `seq` — if the api is slower than the poll period, responses can arrive
-  //    out of order; only the newest one may apply.
+  // The poll re-arms itself *after* each request settles rather than firing on
+  // a fixed interval. That's deliberate: at 1s the api is slower than the poll
+  // period (~2s per response), and a fixed interval would start a new request
+  // before the previous one landed, so every response was superseded by a newer
+  // one and the chart never rendered. Self-scheduling makes overlap impossible
+  // by construction, so a slow api degrades to slower refreshes rather than to
+  // none — at the cost of the period being "time since last completion", so the
+  // real cadence at 1s is ~1s + response time.
+  //
+  // `REQUEST_TIMEOUT_MS` is what keeps that from wedging: a request that never
+  // settles would otherwise never re-arm the timer and the chart would freeze
+  // permanently, with no recovery even once the api came back. The deadline
+  // guarantees the `finally` always runs.
+  //
+  // `cancelled` + `abort` cover the other direction: when the selection changes,
+  // a request already in flight must not overwrite the new interval's data.
   useEffect(() => {
     let cancelled = false;
-    let seq = 0;
     let firstLoad = true;
-    const controller = new AbortController();
+    let timer: number | undefined;
+    let inFlight: AbortController | null = null;
 
     const run = async () => {
-      const current = ++seq;
+      const controller = new AbortController();
+      inFlight = controller;
+      let timedOut = false;
+      const deadline = window.setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, REQUEST_TIMEOUT_MS);
+
       if (firstLoad) setState('loading');
       try {
         const rows = await fetchCandles(symbol, barInterval, { signal: controller.signal });
-        if (cancelled || current !== seq) return; // superseded
+        if (cancelled) return;
         setCandles(rows);
         setState('ready');
         setUpdatedAt(new Date());
       } catch (err) {
-        // An abort is expected when the selection changes — not an error.
-        if (cancelled || controller.signal.aborted) return;
-        setError(err instanceof Error ? err.message : String(err));
+        // An abort from the cleanup below is expected — not an error. A timeout
+        // is a real failure and should surface as one.
+        if (cancelled) return;
+        setError(
+          timedOut
+            ? `No response from the api within ${REQUEST_TIMEOUT_MS / 1000}s — is it running?`
+            : err instanceof Error
+              ? err.message
+              : String(err),
+        );
         setState('error');
       } finally {
+        window.clearTimeout(deadline);
         firstLoad = false;
+        inFlight = null;
+        // Re-arm even after an error, so the chart recovers on its own once the
+        // api is healthy again.
+        if (!cancelled) {
+          timer = window.setTimeout(() => void run(), refreshPeriodMs(barInterval));
+        }
       }
     };
 
     void run();
-    const timer = window.setInterval(() => void run(), refreshPeriodMs(barInterval));
     return () => {
       cancelled = true;
-      controller.abort();
-      window.clearInterval(timer);
+      inFlight?.abort();
+      window.clearTimeout(timer);
     };
   }, [symbol, barInterval, reloadToken]);
 
