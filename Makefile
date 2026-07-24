@@ -20,10 +20,13 @@ infra-down: ## stop infrastructure
 infra-logs: ## tail infrastructure logs
 	$(COMPOSE) logs -f
 
-topics: ## create market topics with explicit configs (idempotent)
+topics: ## create market topics + their .dlq siblings with explicit configs (idempotent)
 	for t in market.trades market.book-tickers market.klines; do \
 		$(COMPOSE) exec redpanda rpk topic create $$t --partitions 6 \
 			--topic-config retention.ms=259200000 \
+			--topic-config cleanup.policy=delete || true; \
+		$(COMPOSE) exec redpanda rpk topic create $$t.dlq --partitions 6 \
+			--topic-config retention.ms=86400000 \
 			--topic-config cleanup.policy=delete || true; \
 	done
 

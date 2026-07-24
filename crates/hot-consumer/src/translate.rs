@@ -21,6 +21,40 @@ use crate::module_bindings::{
 /// `LiveKlineSecond` in the spacetime-module for why only this one.
 const INTERVAL_1S: &str = "1s";
 
+/// Why a message could not be applied, split by whether a retry can help — the
+/// distinction that decides dead-letter vs. retry in the consumer loop.
+#[derive(Debug)]
+pub enum DispatchError {
+    /// The bytes could not be decoded: malformed JSON or an unknown
+    /// `event_type`. **Permanent** — the same bytes will always fail, so the
+    /// message is a poison pill bound for the dead-letter topic.
+    Decode(anyhow::Error),
+    /// A reducer call could not be enqueued on the SDK connection (e.g. the
+    /// connection is down). **Potentially transient** — worth retrying rather
+    /// than dropping what may be perfectly valid data.
+    Enqueue(anyhow::Error),
+}
+
+impl DispatchError {
+    /// Is this failure permanent, i.e. no retry will ever help?
+    pub fn is_permanent(&self) -> bool {
+        matches!(self, DispatchError::Decode(_))
+    }
+
+    /// The underlying error, for logging and dead-letter annotation.
+    pub fn source(&self) -> &anyhow::Error {
+        match self {
+            DispatchError::Decode(e) | DispatchError::Enqueue(e) => e,
+        }
+    }
+}
+
+impl std::fmt::Display for DispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.source())
+    }
+}
+
 /// A fully-decoded reducer invocation, with prices already converted to the
 /// exact strings the module expects. Field order matches the reducer arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,9 +164,10 @@ pub fn decode(bytes: &[u8]) -> Result<ReducerCall> {
 }
 
 /// Decode `bytes` and enqueue the matching reducer call on `conn`. Returns the
-/// event kind on success.
-pub fn dispatch(conn: &DbConnection, bytes: &[u8]) -> Result<&'static str> {
-    let call = decode(bytes)?;
+/// event kind on success, or a [`DispatchError`] classified permanent (decode)
+/// vs. transient (enqueue) so the caller can dead-letter or retry accordingly.
+pub fn dispatch(conn: &DbConnection, bytes: &[u8]) -> Result<&'static str, DispatchError> {
+    let call = decode(bytes).map_err(DispatchError::Decode)?;
     let kind = call.kind();
     match call {
         ReducerCall::Trade {
@@ -152,7 +187,9 @@ pub fn dispatch(conn: &DbConnection, bytes: &[u8]) -> Result<&'static str> {
                 agg_trade_id,
                 is_buyer_maker,
             )
-            .map_err(|e| anyhow::anyhow!("record_trade call failed: {e}"))?,
+            .map_err(|e| {
+                DispatchError::Enqueue(anyhow::anyhow!("record_trade call failed: {e}"))
+            })?,
         ReducerCall::BookTicker {
             symbol,
             best_bid_price,
@@ -170,7 +207,9 @@ pub fn dispatch(conn: &DbConnection, bytes: &[u8]) -> Result<&'static str> {
                 best_ask_qty,
                 update_id,
             )
-            .map_err(|e| anyhow::anyhow!("record_book_ticker call failed: {e}"))?,
+            .map_err(|e| {
+                DispatchError::Enqueue(anyhow::anyhow!("record_book_ticker call failed: {e}"))
+            })?,
         ReducerCall::Kline {
             symbol,
             interval,
@@ -205,7 +244,11 @@ pub fn dispatch(conn: &DbConnection, bytes: &[u8]) -> Result<&'static str> {
                         close_time,
                         is_closed,
                     )
-                    .map_err(|e| anyhow::anyhow!("record_kline_second call failed: {e}"))?;
+                    .map_err(|e| {
+                        DispatchError::Enqueue(anyhow::anyhow!(
+                            "record_kline_second call failed: {e}"
+                        ))
+                    })?;
             }
             conn.reducers
                 .record_kline(
@@ -222,7 +265,9 @@ pub fn dispatch(conn: &DbConnection, bytes: &[u8]) -> Result<&'static str> {
                     close_time,
                     is_closed,
                 )
-                .map_err(|e| anyhow::anyhow!("record_kline call failed: {e}"))?;
+                .map_err(|e| {
+                    DispatchError::Enqueue(anyhow::anyhow!("record_kline call failed: {e}"))
+                })?;
         }
     }
     Ok(kind)
@@ -309,5 +354,17 @@ mod tests {
     #[test]
     fn rejects_malformed_json() {
         assert!(decode(b"{not json").is_err());
+    }
+
+    #[test]
+    fn decode_failures_classify_as_permanent() {
+        // A decode error is a poison pill: no retry can help, so the consumer
+        // must dead-letter it rather than retry.
+        let permanent = DispatchError::Decode(anyhow::anyhow!("bad bytes"));
+        assert!(permanent.is_permanent());
+
+        // An enqueue error is transient: retrying is worth it before giving up.
+        let transient = DispatchError::Enqueue(anyhow::anyhow!("connection down"));
+        assert!(!transient.is_permanent());
     }
 }
