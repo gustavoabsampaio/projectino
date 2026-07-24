@@ -257,6 +257,7 @@ async fn flush(store: &AmazonS3, consumer: &StreamConsumer, buffers: &mut Buffer
         store,
         topics::TRADES,
         &buffers.trades,
+        |e| format!("symbol={}", e.symbol),
         lake::build_trades,
         &mut commit,
     )
@@ -265,6 +266,7 @@ async fn flush(store: &AmazonS3, consumer: &StreamConsumer, buffers: &mut Buffer
         store,
         topics::BOOK_TICKERS,
         &buffers.tickers,
+        |e| format!("symbol={}", e.symbol),
         lake::build_book_tickers,
         &mut commit,
     )
@@ -273,6 +275,7 @@ async fn flush(store: &AmazonS3, consumer: &StreamConsumer, buffers: &mut Buffer
         store,
         topics::KLINES,
         &buffers.klines,
+        |e| format!("symbol={}/interval={}", e.kline.symbol, e.kline.interval),
         lake::build_klines,
         &mut commit,
     )
@@ -295,35 +298,47 @@ async fn flush(store: &AmazonS3, consumer: &StreamConsumer, buffers: &mut Buffer
     Ok(())
 }
 
-/// Group a buffer by partition and write one Parquet file per partition,
-/// recording the max committed offset per (topic, partition).
+/// Write one Parquet file per (Kafka partition, Hive partition dir), recording
+/// the max committed offset per (topic, Kafka partition).
+///
+/// `partition_dir` maps an event to its lake prefix — `symbol=BTCUSDT` for
+/// trades/tickers, `symbol=BTCUSDT/interval=1m` for klines — the columns the api
+/// filters on, lifted out of the file body so DataFusion can prune to matching
+/// files (see the `lake` module docs). The Kafka partition is still the commit
+/// unit and rides in the *filename* (`p{kp}-off-{min}-{max}`), so a replay
+/// re-derives the same object key — an overwrite, not duplicate rows — and two
+/// Kafka partitions that ever carried the same symbol can't collide.
 async fn write_partitioned<T>(
     store: &AmazonS3,
     topic: &str,
     rows: &[Row<T>],
+    partition_dir: impl Fn(&T) -> String,
     build: impl Fn(&[&Row<T>]) -> Result<arrow::array::RecordBatch>,
     commit: &mut BTreeMap<(String, i32), i64>,
 ) -> Result<usize> {
     if rows.is_empty() {
         return Ok(0);
     }
-    let mut by_partition: BTreeMap<i32, Vec<&Row<T>>> = BTreeMap::new();
+    let mut groups: BTreeMap<(i32, String), Vec<&Row<T>>> = BTreeMap::new();
     for row in rows {
-        by_partition.entry(row.partition).or_default().push(row);
+        let dir = partition_dir(&row.event);
+        groups.entry((row.partition, dir)).or_default().push(row);
     }
 
     let mut written = 0;
-    for (partition, group) in by_partition {
+    for ((partition, dir), group) in groups {
         let min = group.iter().map(|r| r.offset).min().unwrap_or(0);
         let max = group.iter().map(|r| r.offset).max().unwrap_or(0);
         let batch = build(&group)?;
         let bytes = lake::to_parquet(&batch)?;
         // Deterministic, zero-padded so lexical order == offset order.
-        let path = format!("{topic}/partition={partition}/off-{min:020}-{max:020}.parquet");
+        let path = format!("{topic}/{dir}/p{partition}-off-{min:020}-{max:020}.parquet");
         store
             .put(&ObjectPath::from(path.as_str()), bytes.into())
             .await
             .with_context(|| format!("uploading {path}"))?;
+        // Commit is per Kafka partition, so max-merge across the symbol/interval
+        // subgroups that share one partition.
         commit
             .entry((topic.to_string(), partition))
             .and_modify(|o| *o = (*o).max(max))

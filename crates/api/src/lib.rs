@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use arrow::array::RecordBatch;
+use arrow::datatypes::DataType;
 use arrow::json::ArrayWriter;
 use axum::extract::{Query, State};
 use axum::http::{HeaderValue, Method, StatusCode};
@@ -46,6 +47,21 @@ fn lake_tables() -> [(&'static str, &'static str); 3] {
         (BOOK_TICKERS, topics::BOOK_TICKERS),
         (KLINES, topics::KLINES),
     ]
+}
+
+/// Hive partition columns encoded in the lake path for a table — the columns
+/// the cold-consumer lifts out of the file body (see its `lake` module). These
+/// are what DataFusion prunes on: a `symbol = '…'` (or `interval = '…'`) filter
+/// only reads the matching directories instead of scanning the whole prefix.
+/// Order must match the path nesting (`symbol=…/interval=…`).
+fn partition_cols(table: &str) -> Vec<(String, DataType)> {
+    match table {
+        KLINES => vec![
+            ("symbol".to_string(), DataType::Utf8),
+            ("interval".to_string(), DataType::Utf8),
+        ],
+        _ => vec![("symbol".to_string(), DataType::Utf8)],
+    }
 }
 
 /// Handler state: the DataFusion context plus the config needed to refresh
@@ -153,7 +169,10 @@ async fn register_table(ctx: &SessionContext, name: &str, topic: &str, cfg: &Con
     // `register_parquet` errors with "table already exists" rather than
     // replacing, so drop the previous registration first (no-op on first call).
     let _ = ctx.deregister_table(name);
-    ctx.register_parquet(name, &path, ParquetReadOptions::default())
+    // Declaring the path partition columns is what turns a `symbol`/`interval`
+    // filter into file pruning rather than a full-prefix scan.
+    let options = ParquetReadOptions::default().table_partition_cols(partition_cols(name));
+    ctx.register_parquet(name, &path, options)
         .await
         .with_context(|| format!("registering {name} from {path}"))
 }
@@ -409,6 +428,103 @@ mod tests {
         for (name, _) in lake_tables() {
             assert!(refreshed.contains_key(name), "no refresh entry for {name}");
         }
+    }
+
+    #[test]
+    fn partition_cols_match_the_lake_layout() {
+        // Order matters: it must mirror the path nesting the cold-consumer
+        // writes (`symbol=…/interval=…`), or DataFusion parses the wrong value
+        // out of each segment.
+        let klines = partition_cols(KLINES);
+        assert_eq!(
+            klines,
+            vec![
+                ("symbol".to_string(), DataType::Utf8),
+                ("interval".to_string(), DataType::Utf8),
+            ]
+        );
+        // Trades and book_tickers partition by symbol only (book_tickers carries
+        // no timestamp to date-partition on).
+        assert_eq!(
+            partition_cols(TRADES),
+            vec![("symbol".to_string(), DataType::Utf8)]
+        );
+        assert_eq!(
+            partition_cols(BOOK_TICKERS),
+            vec![("symbol".to_string(), DataType::Utf8)]
+        );
+    }
+
+    /// End-to-end proof of the writer↔reader contract this change rests on: a
+    /// file body with *no* `symbol`/`interval` column, laid out under
+    /// `symbol=…/interval=…/`, must read back through the api's partition-col
+    /// registration with those columns synthesized from the path — and a
+    /// `symbol` filter must select the right rows (which is also what prunes).
+    #[tokio::test]
+    async fn hive_partitioned_lake_reads_back_symbol_and_interval() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{Field, Schema};
+        use datafusion::parquet::arrow::ArrowWriter;
+
+        // Unique temp root, cleaned at both ends so a previous panic can't leak in.
+        let root = std::env::temp_dir().join(format!(
+            "projectino-hive-test-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // The stored body deliberately omits symbol/interval — they live in the
+        // path, exactly as the cold-consumer now writes them.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "open_time",
+            DataType::Int64,
+            false,
+        )]));
+        let write = |dir: &str, times: Vec<i64>| {
+            let full = root.join("market.klines").join(dir);
+            std::fs::create_dir_all(&full).unwrap();
+            let file = std::fs::File::create(full.join("part.parquet")).unwrap();
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(times))])
+                    .unwrap();
+            let mut w = ArrowWriter::try_new(file, schema.clone(), None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+        };
+        write("symbol=BTCUSDT/interval=1m", vec![1, 2, 3]);
+        write("symbol=ETHUSDT/interval=1m", vec![4, 5]);
+
+        let ctx = SessionContext::new();
+        let prefix = format!("{}/market.klines/", root.to_str().unwrap());
+        ctx.register_parquet(
+            KLINES,
+            &prefix,
+            ParquetReadOptions::default().table_partition_cols(partition_cols(KLINES)),
+        )
+        .await
+        .expect("registers over the local Hive layout");
+
+        // Filtering on a path partition column is the whole point: only BTC rows
+        // come back, and symbol/interval are present though never stored.
+        let df = ctx
+            .table(KLINES)
+            .await
+            .unwrap()
+            .filter(col("symbol").eq(lit("BTCUSDT")))
+            .unwrap();
+        let json = batches_to_json(&df.collect().await.unwrap()).expect("serializes");
+        let rows = json.as_array().unwrap();
+        assert_eq!(rows.len(), 3, "only the three BTCUSDT rows");
+        for row in rows {
+            assert_eq!(row["symbol"], "BTCUSDT");
+            assert_eq!(row["interval"], "1m");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
