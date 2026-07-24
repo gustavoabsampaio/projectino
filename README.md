@@ -370,19 +370,22 @@ sense at this level. Not a backlog in priority order.
   0.41 but we pin 0.39.4 transitively via `object_store` — and only ever parse
   our own local MinIO's XML, never attacker input. Revisit on the next
   `object_store` bump. See the comments in `deny.toml` for the full rationale.
-- Dead-letter routing. **Hot-consumer: done (2026-07-24).** It splits failures
-  by whether a retry can help: an *undecodable* message (malformed JSON / unknown
-  `event_type`) is a permanent poison pill, routed to the topic's `.dlq` sibling
-  — original bytes as payload, error reason + source coordinates as headers —
-  and only then committed past. A reducer *enqueue* failure is treated as
-  transient (SpacetimeDB briefly down): retried with capped backoff and never
-  committed until it applies, so a persistent failure stops the consumer with
-  the offset uncommitted rather than dropping valid data. `.dlq` topics are
-  created by `make topics` (1-day retention). **Cold-consumer: still TODO** —
-  it only skips permanent decode failures, so the same DLQ-on-decode-failure
-  pattern applies there (marked `TODO` in `crates/cold-consumer/src/lib.rs`),
-  without the transient-retry half (a Parquet flush failure is already handled
-  by not committing the batch).
+- Dead-letter routing. **Done for both consumers (2026-07-24).** Undecodable
+  messages (malformed JSON / unknown `event_type`) are permanent poison pills,
+  routed to the topic's `.dlq` sibling — original bytes as payload, error reason
+  + source coordinates as headers — instead of being dropped. `.dlq` topics are
+  created by `make topics` (1-day retention).
+  - *Hot-consumer* additionally distinguishes a reducer *enqueue* failure as
+    potentially transient (SpacetimeDB briefly down): retried with capped
+    backoff and never committed until it applies, so a persistent failure stops
+    the consumer with the offset uncommitted rather than dropping valid data.
+  - *Cold-consumer* has no transient class — a Parquet flush failure is already
+    handled by not committing the batch, so those messages replay. Because it
+    commits offsets in batches (`max+1` per partition), a poison pill is
+    dead-lettered *at decode time*, awaiting delivery before a later flush can
+    commit past it. A poison pill isolated in a partition with no later message
+    may be re-dead-lettered on restart until a good message advances the commit;
+    DLQ duplicates are acceptable (visibility, not reprocessing automation).
 - Performance metrics: the replay `Stats` and the ingestor currently track only
   correctness counters (events, decode errors) — add throughput (frames/s,
   events/s) and latency (decode time, Kafka produce time) instrumentation, plus

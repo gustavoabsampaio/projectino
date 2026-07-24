@@ -9,22 +9,32 @@
 //! (never before). A crash between write and commit replays the same offsets,
 //! re-deriving the same filenames — an overwrite, not duplicate rows.
 //!
-//! TODO: undecodable messages are logged and skipped; route them to a `.dlq`
-//! topic. Batch boundaries can shift across restarts, so overlapping files are
+//! Undecodable messages are routed to the topic's `.dlq` sibling rather than
+//! dropped (see [`dead_letter`]). Unlike the hot path there is no transient
+//! failure class here: a decode failure is a permanent poison pill, and the
+//! only other failure — a Parquet flush — is already handled by not committing
+//! the batch, so those messages simply replay. Because offsets are committed in
+//! batches (`max+1` per partition), a poison pill is dead-lettered *at decode
+//! time*, awaiting delivery before a later flush can commit past it.
+//!
+//! Batch boundaries can shift across restarts, so overlapping files are
 //! theoretically possible — acceptable for this stage.
 
 pub mod config;
 pub mod lake;
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use object_store::ObjectStoreExt;
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::path::Path as ObjectPath;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
-use rdkafka::message::BorrowedMessage;
+use rdkafka::message::{BorrowedMessage, Header, OwnedHeaders};
+use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::topic_partition_list::Offset;
+use rdkafka::util::Timeout;
 use rdkafka::{ClientConfig, Message, TopicPartitionList};
 use serde::Deserialize;
 use tracing::{info, warn};
@@ -60,6 +70,7 @@ impl Buffers {
 
 pub async fn run(cfg: Config) -> Result<()> {
     let consumer = build_consumer(&cfg)?;
+    let producer = connect_producer(&cfg)?;
     let store = build_store(&cfg)?;
     info!(
         bucket = %cfg.bucket,
@@ -88,7 +99,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             }
             received = consumer.recv() => {
                 let msg = received.context("Kafka receive error")?;
-                buffer_message(&msg, &mut buffers);
+                buffer_message(&producer, &msg, &mut buffers).await?;
                 if buffers.len() >= cfg.batch_max_rows {
                     flush(&store, &consumer, &mut buffers).await?;
                 }
@@ -96,6 +107,18 @@ pub async fn run(cfg: Config) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Build the DLQ producer. Mirrors the ingestor's producer conventions
+/// (`acks=all`, idempotent) so a dead-lettered message is durably parked.
+fn connect_producer(cfg: &Config) -> Result<FutureProducer> {
+    ClientConfig::new()
+        .set("bootstrap.servers", &cfg.kafka_brokers)
+        .set("acks", "all")
+        .set("enable.idempotence", "true")
+        .set("message.timeout.ms", "10000")
+        .create()
+        .context("failed to create DLQ Kafka producer")
 }
 
 fn build_consumer(cfg: &Config) -> Result<StreamConsumer> {
@@ -127,14 +150,21 @@ fn build_store(cfg: &Config) -> Result<AmazonS3> {
         .context("failed to build MinIO (S3) client")
 }
 
-/// Decode one message and append it to the matching buffer. Bad messages are
-/// logged and skipped (never fatal).
-fn buffer_message(msg: &BorrowedMessage, buffers: &mut Buffers) {
+/// Decode one message and append it to the matching buffer. An undecodable
+/// message is a permanent poison pill: it is routed to the topic's `.dlq`
+/// sibling (awaiting delivery) rather than dropped. Returns `Err` only if the
+/// dead-letter produce itself fails, so the consumer stops with the offset
+/// uncommitted rather than losing the message.
+async fn buffer_message(
+    producer: &FutureProducer,
+    msg: &BorrowedMessage<'_>,
+    buffers: &mut Buffers,
+) -> Result<()> {
     let partition = msg.partition();
     let offset = msg.offset();
     let Some(bytes) = msg.payload() else {
         warn!(partition, offset, "empty Kafka payload; skipping");
-        return;
+        return Ok(());
     };
     match decode(bytes) {
         Ok(Decoded::Trade(event)) => buffers.trades.push(Row {
@@ -152,13 +182,67 @@ fn buffer_message(msg: &BorrowedMessage, buffers: &mut Buffers) {
             offset,
             event,
         }),
-        Err(error) => warn!(
-            partition,
-            offset,
-            error = %format!("{error:#}"),
-            "skipping undecodable message (TODO: DLQ)"
-        ),
+        Err(error) => {
+            warn!(
+                partition,
+                offset,
+                error = %format!("{error:#}"),
+                "undecodable message → dead-letter topic"
+            );
+            dead_letter(producer, msg, bytes, &error).await?;
+        }
     }
+    Ok(())
+}
+
+/// Route a poison-pill message to its `.dlq` sibling topic, awaiting delivery so
+/// the message is durably parked before a later flush commits the source offset
+/// past it. The original bytes are preserved verbatim as the payload; the
+/// failure reason and source coordinates ride as headers for inspection in the
+/// Redpanda console (per the kafka-schema-conventions skill).
+async fn dead_letter(
+    producer: &FutureProducer,
+    msg: &BorrowedMessage<'_>,
+    bytes: &[u8],
+    error: &anyhow::Error,
+) -> Result<()> {
+    let source_topic = msg.topic();
+    let dlq_topic = topics::dlq(source_topic);
+    let partition = msg.partition().to_string();
+    let offset = msg.offset().to_string();
+    let reason = format!("{error:#}");
+
+    let headers = OwnedHeaders::new()
+        .insert(Header {
+            key: "dlq.error",
+            value: Some(reason.as_str()),
+        })
+        .insert(Header {
+            key: "dlq.source_topic",
+            value: Some(source_topic),
+        })
+        .insert(Header {
+            key: "dlq.partition",
+            value: Some(partition.as_str()),
+        })
+        .insert(Header {
+            key: "dlq.offset",
+            value: Some(offset.as_str()),
+        });
+
+    // Preserve the symbol key so per-symbol ordering carries into the DLQ.
+    let key = msg.key().unwrap_or_default();
+    let record = FutureRecord::to(&dlq_topic)
+        .key(key)
+        .payload(bytes)
+        .headers(headers);
+
+    producer
+        .send(record, Timeout::After(Duration::from_secs(10)))
+        .await
+        .map_err(|(error, _)| error)
+        .with_context(|| format!("failed to produce to dead-letter topic {dlq_topic}"))?;
+    Ok(())
 }
 
 /// Flush all buffers: write one Parquet file per (topic, partition), then
