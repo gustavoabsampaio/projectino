@@ -407,3 +407,86 @@ sense at this level. Not a backlog in priority order.
   observation against two. If it recurs, test with a single low-volume stream:
   a drop with no backlog would point at the endpoint or the network path rather
   than at us.
+
+### From an architecture/code review (2026-07-24)
+
+The items below came out of a read-through of the whole workspace, not from
+running into them in production. Roughly ordered by impact; none are addressed
+yet. Some sharpen a lever already named above rather than adding a new one.
+
+- **Lake partitioning does not match the query patterns — this is the real
+  driver of `/klines` and `/trades` scan latency, not a fixed cost.** The
+  cold-consumer partitions the lake by *Kafka partition*
+  (`{topic}/partition={kafka_partition}/…` in `crates/cold-consumer/src/lib.rs`),
+  which is an ingestion artifact, not a query dimension. Every api query filters
+  by `symbol` (and `interval` for klines) and sorts by time, but nothing in the
+  file layout lets DataFusion prune to the relevant files — so
+  `/trades?symbol=BTCUSDT` scans *every* symbol's trades, sorts the lot, then
+  applies `LIMIT`. That is the ~1.1s scan, and it grows with total lake size
+  without bound. Hive-style partitioning (`symbol=…/interval=…/date=…`) would let
+  DataFusion prune to a handful of files per query, and would make the
+  deep-history/time-range work above prunable rather than a full scan. This is a
+  larger lever than the api-side "latest per open_time" aggregation noted
+  earlier. **Breaking:** it changes the lake layout, so reset the bucket
+  (`make lake-reset`) and repopulate, same as the `Decimal128` migration above.
+- **No lake compaction and no lake retention.** Each flush writes one small
+  Parquet file per (topic, partition) every `COLD_BATCH_MAX_ROWS`/`COLD_FLUSH_SECS`,
+  so the lake accumulates thousands of tiny files. Small files inflate both the
+  `LIST` (O(files) — the cost `API_LISTING_TTL_MS` exists to amortize) and the
+  scan (per-file footer/open overhead), and nothing merges them. Separately, the
+  lake has no lifecycle policy: the Kafka topics expire after 3 days but the lake
+  grows forever, so LIST and scan cost climb without bound over time. A periodic
+  compaction step (merge small files into larger ones) plus a date-partition and
+  an object-store lifecycle rule would bound both.
+- **Cold-consumer flush blocks the runtime and the consume loop.**
+  `lake::to_parquet` is CPU-bound synchronous encoding run directly on the async
+  task, and the per-partition `store.put(...)` uploads are awaited one at a time
+  (`crates/cold-consumer/src/lib.rs`). While a flush runs, `consumer.recv()` is
+  not polled, so ingestion stalls for the whole encode + upload. Wrapping the
+  encode in `spawn_blocking` and uploading the partition files concurrently
+  (`try_join_all`) would keep the reactor and the consume loop moving. Not
+  visible at single-symbol dev volume; a throughput ceiling as symbols/rate grow.
+- **Ingestor spawns a task per delivered message.** `publish`
+  (`crates/ingestor/src/handler.rs`) does `tokio::spawn` for every successfully
+  queued record purely to observe its delivery report and count failures — about
+  one spawn per message at the sustained rate. A custom rdkafka `ProducerContext`
+  with a `delivery` callback would tally failures with no per-message future.
+  Functionally correct today (the spawns are bounded by the queue-full
+  backpressure), but churny.
+- **Hot-consumer commits every message and processes serially.** It calls
+  `commit_message(..., Async)` per message (`crates/hot-consumer/src/lib.rs`);
+  given the self-healing upsert tables, periodic commits (every N messages or on
+  a timer) would cut OffsetCommit traffic with no correctness loss, since replay
+  is already safe. The loop is also a single serial task across all three
+  topics/partitions — fine at the measured rate, but the only path to more is the
+  same websocket/consumer sharding noted for the ingestor.
+- **`fresh_table` releases its lock before taking the table handle.** The
+  per-table `Mutex` meant to collapse concurrent refreshes drops at the end of
+  the refresh block, then `ctx.table(name)` runs outside it
+  (`crates/api/src/lib.rs`), so a concurrent refresh can deregister/re-register
+  on the shared `SessionContext` in the gap. Low-probability and likely benign,
+  but the "one refresh, shared" invariant does not actually hold to the point of
+  use.
+- **`/klines` and `/trades` return mixed-meaning rows when `interval`/`symbol`
+  are omitted.** With no `interval`, the klines handler returns the newest N
+  closed candles *across all intervals interleaved* plus one forming candle
+  across all intervals; `/trades` with no `symbol` interleaves symbols. The
+  frontend always passes both, so it is latent — but the endpoints should reject
+  the ambiguous case (400) rather than answer with nonsense.
+- **The api echoes internal error strings to clients.**
+  `AppError::into_response` puts `err.to_string()` in the JSON body
+  (`crates/api/src/lib.rs`), disclosing DataFusion/object-store internals. Fine
+  for a local portfolio API; a generic 500 body plus the existing server-side log
+  line is the usual split before this is exposed anywhere.
+- **Empty-payload messages are skipped without dead-lettering or advancing the
+  offset.** Both consumers `warn` and continue on a `None` payload without
+  committing past it, so one at a partition tail re-warns on every restart (like
+  the acknowledged poison-pill-at-tail case, but not even parked in the DLQ).
+  "Shouldn't happen from the ingestor," so low priority — noted for completeness
+  alongside the DLQ behaviour above.
+- **`Symbol` is a closed two-variant enum.** `common::symbol::Symbol` hardcodes
+  `BtcUsdt`/`EthUsdt` with hand-written `FromStr`/`as_*` arms, and the frontend
+  hardcodes the same list (`frontend/src/App.tsx`), so adding a symbol is a
+  multi-site code change despite `SYMBOLS` being an env var. A validated newtype
+  over the uppercase/lowercase string pair (or pulling the exchange symbol list)
+  would make the configurability real.
