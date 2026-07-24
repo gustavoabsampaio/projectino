@@ -121,7 +121,7 @@ bun run dev                   # http://localhost:5173
 | MinIO + bucket | http://localhost:9001 (minioadmin/minioadmin), bucket `market-lake` |
 | SpacetimeDB | `curl http://localhost:3000/v1/database/projectino` (200 after publish) |
 | Live state (hot path) | run `hot-consumer`, then `spacetime sql --server http://localhost:3000 projectino "SELECT symbol, price FROM live_trade"` |
-| Lake files (cold path) | run `cold-consumer`, then browse http://localhost:9001 → bucket `market-lake` (Parquet under `market.trades/partition=…/`) |
+| Lake files (cold path) | run `cold-consumer`, then browse http://localhost:9001 → bucket `market-lake` (Parquet under `market.trades/symbol=…/`, klines under `market.klines/symbol=…/interval=…/`) |
 | Axum API (health) | `curl http://localhost:8081/health` → `{"status":"ok"}` |
 | History query (cold path) | `curl "http://localhost:8081/trades?symbol=BTCUSDT&limit=5"` (also `/book_tickers`, `/klines?symbol=…&interval=1m`) |
 | Live 1s window | `spacetime sql --server http://localhost:3000 projectino "SELECT COUNT(*) AS n FROM live_kline_second"` (needs ingestor + hot-consumer; aggregates require an alias) |
@@ -415,20 +415,31 @@ running into them in production. Roughly ordered by impact; none are addressed
 yet. Some sharpen a lever already named above rather than adding a new one.
 
 - **Lake partitioning does not match the query patterns — this is the real
-  driver of `/klines` and `/trades` scan latency, not a fixed cost.** The
-  cold-consumer partitions the lake by *Kafka partition*
-  (`{topic}/partition={kafka_partition}/…` in `crates/cold-consumer/src/lib.rs`),
-  which is an ingestion artifact, not a query dimension. Every api query filters
-  by `symbol` (and `interval` for klines) and sorts by time, but nothing in the
-  file layout lets DataFusion prune to the relevant files — so
-  `/trades?symbol=BTCUSDT` scans *every* symbol's trades, sorts the lot, then
-  applies `LIMIT`. That is the ~1.1s scan, and it grows with total lake size
-  without bound. Hive-style partitioning (`symbol=…/interval=…/date=…`) would let
-  DataFusion prune to a handful of files per query, and would make the
-  deep-history/time-range work above prunable rather than a full scan. This is a
-  larger lever than the api-side "latest per open_time" aggregation noted
-  earlier. **Breaking:** it changes the lake layout, so reset the bucket
-  (`make lake-reset`) and repopulate, same as the `Decimal128` migration above.
+  driver of `/klines` and `/trades` scan latency, not a fixed cost.**
+  **Partly done (2026-07-24): the lake is now Hive-partitioned by `symbol`, and
+  klines additionally by `interval`.** The cold-consumer used to partition only
+  by *Kafka partition* (`{topic}/partition={kafka_partition}/…`), an ingestion
+  artifact rather than a query dimension, so nothing let DataFusion prune:
+  `/trades?symbol=BTCUSDT` scanned *every* symbol's trades. Now those columns are
+  lifted out of the file body into the object path
+  (`market.trades/symbol=BTCUSDT/…`, `market.klines/symbol=…/interval=…/…`) and
+  declared to DataFusion as `table_partition_cols`, so a `symbol`/`interval`
+  filter reads only the matching directories. The Kafka partition + offset range
+  still ride in the filename (`p{kp}-off-{min}-{max}.parquet`), preserving the
+  deterministic, idempotent-on-replay naming. Covered by a writer→reader
+  round-trip test in `crates/api/src/lib.rs`.
+  - **Still open:** the api sort + `LIMIT` still materializes over whatever files
+    survive pruning, and there is no **date** partition yet — that pairs with the
+    deep-history/time-range work above (and book_tickers carries no timestamp to
+    date-partition on, so it stays symbol-only). This is a larger lever than the
+    api-side "latest per open_time" aggregation noted earlier; the pruning is the
+    first half, a named time window is the second. The latency win is not
+    re-measured yet — the mechanism is in place, the benchmark under a realistic
+    multi-symbol lake is pending.
+  - **Breaking:** this changed the lake layout *and* the file schemas (symbol/
+    interval are no longer stored columns), so old files fail to read alongside
+    new ones. Reset the bucket (`make lake-reset`) and repopulate, same as the
+    `Decimal128` migration above.
 - **No lake compaction and no lake retention.** Each flush writes one small
   Parquet file per (topic, partition) every `COLD_BATCH_MAX_ROWS`/`COLD_FLUSH_SECS`,
   so the lake accumulates thousands of tiny files. Small files inflate both the

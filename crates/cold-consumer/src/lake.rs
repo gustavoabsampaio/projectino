@@ -8,13 +8,22 @@
 //! volume needs. The api casts the column back to a string at the JSON boundary
 //! so the wire format stays exact-decimal-as-string (see `batches_to_json`).
 //! Each row also carries its Kafka `partition`/`offset` for lineage.
+//!
+//! **Hive partitioning.** The columns queries filter on — `symbol` for every
+//! event type, plus `interval` for klines — are *not* stored in the file body.
+//! They live in the object path instead (`symbol=BTCUSDT/…`,
+//! `symbol=BTCUSDT/interval=1m/…`), written by the cold-consumer and declared
+//! to DataFusion as `table_partition_cols`, so a `symbol = '…'` filter prunes to
+//! the matching files rather than scanning the whole lake. DataFusion
+//! synthesizes those columns back from the path, so query results still carry
+//! `symbol`/`interval` exactly as before — they are just no longer duplicated
+//! into every row on disk.
 
 use std::sync::Arc;
 
 use anyhow::Result;
 use arrow::array::{
     ArrayRef, BooleanBuilder, Decimal128Builder, Int32Builder, Int64Builder, RecordBatch,
-    StringBuilder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use common::events::{AggTrade, BookTicker, KlineEvent};
@@ -81,8 +90,8 @@ pub fn to_parquet(batch: &RecordBatch) -> Result<Vec<u8>> {
 // --- trades ---
 
 pub fn trades_schema() -> SchemaRef {
+    // `symbol` is a path partition column, not a stored one — see the module docs.
     let mut fields = vec![
-        field("symbol", DataType::Utf8),
         decimal_field("price"),
         decimal_field("quantity"),
         field("trade_time", DataType::Int64),
@@ -94,7 +103,6 @@ pub fn trades_schema() -> SchemaRef {
 }
 
 pub fn build_trades(rows: &[&Row<AggTrade>]) -> Result<RecordBatch> {
-    let mut symbol = StringBuilder::new();
     let mut price = decimal_builder();
     let mut quantity = decimal_builder();
     let mut trade_time = Int64Builder::new();
@@ -104,7 +112,6 @@ pub fn build_trades(rows: &[&Row<AggTrade>]) -> Result<RecordBatch> {
     let mut offset = Int64Builder::new();
 
     for r in rows {
-        symbol.append_value(&r.event.symbol);
         price.append_value(to_decimal128(r.event.price));
         quantity.append_value(to_decimal128(r.event.quantity));
         trade_time.append_value(r.event.trade_time);
@@ -115,7 +122,6 @@ pub fn build_trades(rows: &[&Row<AggTrade>]) -> Result<RecordBatch> {
     }
 
     let columns: Vec<ArrayRef> = vec![
-        Arc::new(symbol.finish()),
         Arc::new(price.finish()),
         Arc::new(quantity.finish()),
         Arc::new(trade_time.finish()),
@@ -130,8 +136,8 @@ pub fn build_trades(rows: &[&Row<AggTrade>]) -> Result<RecordBatch> {
 // --- book tickers ---
 
 pub fn book_tickers_schema() -> SchemaRef {
+    // `symbol` is a path partition column, not a stored one — see the module docs.
     let mut fields = vec![
-        field("symbol", DataType::Utf8),
         decimal_field("best_bid_price"),
         decimal_field("best_bid_qty"),
         decimal_field("best_ask_price"),
@@ -143,7 +149,6 @@ pub fn book_tickers_schema() -> SchemaRef {
 }
 
 pub fn build_book_tickers(rows: &[&Row<BookTicker>]) -> Result<RecordBatch> {
-    let mut symbol = StringBuilder::new();
     let mut best_bid_price = decimal_builder();
     let mut best_bid_qty = decimal_builder();
     let mut best_ask_price = decimal_builder();
@@ -153,7 +158,6 @@ pub fn build_book_tickers(rows: &[&Row<BookTicker>]) -> Result<RecordBatch> {
     let mut offset = Int64Builder::new();
 
     for r in rows {
-        symbol.append_value(&r.event.symbol);
         best_bid_price.append_value(to_decimal128(r.event.best_bid_price));
         best_bid_qty.append_value(to_decimal128(r.event.best_bid_qty));
         best_ask_price.append_value(to_decimal128(r.event.best_ask_price));
@@ -164,7 +168,6 @@ pub fn build_book_tickers(rows: &[&Row<BookTicker>]) -> Result<RecordBatch> {
     }
 
     let columns: Vec<ArrayRef> = vec![
-        Arc::new(symbol.finish()),
         Arc::new(best_bid_price.finish()),
         Arc::new(best_bid_qty.finish()),
         Arc::new(best_ask_price.finish()),
@@ -179,9 +182,9 @@ pub fn build_book_tickers(rows: &[&Row<BookTicker>]) -> Result<RecordBatch> {
 // --- klines ---
 
 pub fn klines_schema() -> SchemaRef {
+    // `symbol` and `interval` are path partition columns, not stored ones — see
+    // the module docs.
     let mut fields = vec![
-        field("symbol", DataType::Utf8),
-        field("interval", DataType::Utf8),
         decimal_field("open"),
         decimal_field("high"),
         decimal_field("low"),
@@ -198,8 +201,6 @@ pub fn klines_schema() -> SchemaRef {
 }
 
 pub fn build_klines(rows: &[&Row<KlineEvent>]) -> Result<RecordBatch> {
-    let mut symbol = StringBuilder::new();
-    let mut interval = StringBuilder::new();
     let mut open = decimal_builder();
     let mut high = decimal_builder();
     let mut low = decimal_builder();
@@ -215,8 +216,6 @@ pub fn build_klines(rows: &[&Row<KlineEvent>]) -> Result<RecordBatch> {
 
     for r in rows {
         let k = &r.event.kline;
-        symbol.append_value(&k.symbol);
-        interval.append_value(&k.interval);
         open.append_value(to_decimal128(k.open));
         high.append_value(to_decimal128(k.high));
         low.append_value(to_decimal128(k.low));
@@ -232,8 +231,6 @@ pub fn build_klines(rows: &[&Row<KlineEvent>]) -> Result<RecordBatch> {
     }
 
     let columns: Vec<ArrayRef> = vec![
-        Arc::new(symbol.finish()),
-        Arc::new(interval.finish()),
         Arc::new(open.finish()),
         Arc::new(high.finish()),
         Arc::new(low.finish()),
@@ -281,7 +278,12 @@ mod tests {
         let refs: Vec<&Row<AggTrade>> = rows.iter().collect();
         let batch = build_trades(&refs).expect("batch builds");
         assert_eq!(batch.num_rows(), 2);
-        assert_eq!(batch.num_columns(), 8);
+        // symbol is a path partition column now, not a stored one: price,
+        // quantity, trade_time, agg_trade_id, is_buyer_maker + 2 lineage cols.
+        assert_eq!(batch.num_columns(), 7);
+        // The partition columns must not be written into the file body, or
+        // DataFusion's partition-col registration would see a duplicate.
+        assert!(batch.schema().field_with_name("symbol").is_err());
 
         let bytes = to_parquet(&batch).expect("parquet serializes");
         // Parquet files start with the "PAR1" magic and are non-trivial.
