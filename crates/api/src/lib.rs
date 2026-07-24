@@ -291,12 +291,20 @@ async fn klines(
 }
 
 /// Serialize Arrow record batches to a JSON array of row objects.
+///
+/// The lake stores prices/quantities as native `Decimal128(38, 8)` (so
+/// analytical queries can aggregate them without a cast), but Arrow's JSON
+/// writer renders a decimal as a JSON *number* — which routes exact values
+/// through an f64 and drops the "decimal string, never for accounting" contract
+/// the frontend and the SpacetimeDB live path both rely on. Casting the decimal
+/// columns to `Utf8` first keeps the wire format an exact string (e.g.
+/// `"64000.50000000"`).
 fn batches_to_json(batches: &[RecordBatch]) -> Result<serde_json::Value, AppError> {
     let mut buf = Vec::new();
     {
         let mut writer = ArrayWriter::new(&mut buf);
         for batch in batches {
-            writer.write(batch)?;
+            writer.write(&decimals_to_strings(batch)?)?;
         }
         writer.finish()?;
     }
@@ -304,6 +312,38 @@ fn batches_to_json(batches: &[RecordBatch]) -> Result<serde_json::Value, AppErro
         return Ok(serde_json::json!([]));
     }
     Ok(serde_json::from_slice(&buf)?)
+}
+
+/// Cast every `Decimal128` column of a batch to `Utf8`, leaving other columns
+/// untouched. Returns the batch unchanged (a cheap clone of `Arc`s) when there
+/// is nothing to convert.
+fn decimals_to_strings(batch: &RecordBatch) -> Result<RecordBatch, AppError> {
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let schema = batch.schema();
+    let has_decimal = schema
+        .fields()
+        .iter()
+        .any(|f| matches!(f.data_type(), DataType::Decimal128(_, _)));
+    if !has_decimal {
+        return Ok(batch.clone());
+    }
+
+    let mut fields = Vec::with_capacity(schema.fields().len());
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for (f, column) in schema.fields().iter().zip(batch.columns()) {
+        if matches!(f.data_type(), DataType::Decimal128(_, _)) {
+            columns.push(arrow::compute::cast(column, &DataType::Utf8)?);
+            fields.push(Field::new(f.name(), DataType::Utf8, f.is_nullable()));
+        } else {
+            columns.push(column.clone());
+            fields.push(f.as_ref().clone());
+        }
+    }
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns,
+    )?)
 }
 
 /// Any handler error → 500 with a JSON error body. Uses the axum + anyhow
@@ -375,5 +415,36 @@ mod tests {
     fn empty_batches_serialize_to_empty_array() {
         let json = batches_to_json(&[]).expect("empty serializes");
         assert_eq!(json, serde_json::json!([]));
+    }
+
+    #[test]
+    fn decimal_columns_serialize_as_exact_strings() {
+        use arrow::array::Decimal128Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        // 64000.50000000 at scale 8, and a value whose 16 significant digits
+        // cannot be represented exactly as an f64 — proof we never route a
+        // decimal through a float (90071992547409.93 = (2^53 + 1) / 100).
+        let arr = Decimal128Array::from(vec![
+            6_400_050_000_000i128,
+            9_007_199_254_740_993_000_000i128,
+        ])
+        .with_precision_and_scale(38, 8)
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "price",
+            DataType::Decimal128(38, 8),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+
+        let json = batches_to_json(&[batch]).expect("serializes");
+        assert_eq!(
+            json,
+            serde_json::json!([
+                { "price": "64000.50000000" },
+                { "price": "90071992547409.93000000" },
+            ])
+        );
     }
 }

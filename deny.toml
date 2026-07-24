@@ -5,20 +5,26 @@ all-features = false
 
 [advisories]
 yanked = "deny"
-# Deferred advisories. None reach `common`/`ingestor`/`hot-consumer`. Revisit
-# on the next dependency bump — the fixes may arrive transitively. Reviewed
-# 2026-07-20.
+# Deferred advisories. All three now reach the implemented `api` and
+# `cold-consumer` (not just a skeleton), so each is justified below on its own
+# current merits rather than on unreachability. None reach `common`/`ingestor`/
+# `hot-consumer`. Reviewed 2026-07-24.
 ignore = [
-    # `paste` is unmaintained (proc-macro, no runtime vuln). Via datafusion.
-    # NOTE 2026-07-21: this was deferred on the grounds that datafusion was only
-    # pulled in by a not-yet-implemented `api` skeleton. The api is implemented
-    # and running now, so that reasoning no longer applies — the deferral stands
-    # only on "proc-macro, no runtime vulnerability" and is due for review.
+    # RUSTSEC-2024-0436: `paste` 1.0.15 is unmaintained. This is an
+    # informational advisory, not a vulnerability — there is no patched version
+    # to move to, and `paste` is a proc-macro that runs only at compile time and
+    # ships no runtime code. Reaches us via `parquet` (used directly by
+    # cold-consumer, and by datafusion in the api). Removable only if the whole
+    # parquet/datafusion stack drops it or migrates to `pastey`; nothing to do
+    # on our side until then.
     "RUSTSEC-2024-0436",
-    # quick-xml DoS (fixed in 0.41), via object_store's S3 XML parsing. Now
-    # reachable through the implemented cold-consumer, but only against our own
-    # local MinIO responses (not attacker-controlled), so low risk. Bump when
-    # object_store ships a quick-xml >= 0.41.
+    # RUSTSEC-2026-0194 (quadratic attribute scan) and RUSTSEC-2026-0195
+    # (unbounded namespace allocation): both are quick-xml DoS bugs patched in
+    # 0.41.0. We pin 0.39.4 transitively via object_store 0.13.2, which parses
+    # S3/XML responses for both the api and cold-consumer. The only XML either
+    # crate parses comes from our own local MinIO, never an attacker — so the
+    # DoS vector is not exposed. Bump when object_store ships a quick-xml >=
+    # 0.41; there is no fixed version reachable through the tree today.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
 ]

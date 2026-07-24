@@ -327,8 +327,21 @@ sense at this level. Not a backlog in priority order.
   window it names rather than "the latest N", fetching more as the user pans.
   Until that lands, treat the displayed range as best-effort rather than a
   guarantee — it is not a bug that two sessions disagree.
-- API refinements: a `Decimal128` lake schema so price aggregations don't need a
-  cast.
+- The lake stores prices/quantities as native `Decimal128(38, 8)` (done
+  2026-07-24) so analytical queries aggregate them without a cast. Scale 8 is
+  lossless for Binance payloads; the api casts the column back to a string at
+  the JSON boundary so the wire format stays exact-decimal-as-string. **Breaking
+  migration:** this changed the Parquet column type, so a lake holding older
+  `Utf8` files will fail DataFusion's schema unification when queried alongside
+  new files. Reset the lake bucket before running the new cold-consumer against
+  old data — `make lake-reset` (empties `market-lake`), then re-run
+  `make backfill` and the cold-consumer to repopulate.
+  - The `Decimal128 → Utf8` cast in `batches_to_json` is **intentional, not a
+    cleanup target.** The data is numeric in the lake and text on the wire, so
+    the conversion has to live somewhere; placing it at the JSON boundary casts
+    only the ≤`MAX_LIMIT` returned rows, versus casting every *scanned* row if
+    the lake were `Utf8` and a future aggregation had to `CAST` back to decimal.
+    It is also dwarfed by the ~1.1s Parquet scan. Leave it be.
 - The chart's interval list (`INTERVALS` in `frontend/src/lib/intervals.ts`) must
   be kept in sync by hand with `DEFAULT_INTERVALS` in
   `crates/ingestor/src/config.rs` — one is TypeScript, the other Rust, and
@@ -349,10 +362,14 @@ sense at this level. Not a backlog in priority order.
   untested.
 - Regenerate SDK bindings with `make module-generate` after module schema
   changes.
-- **Due now:** the `deny.toml` advisory deferrals were taken while `api` was a
-  skeleton and `cold-consumer` unbuilt. Both are implemented, so the rationale
-  ("only pulled in by the not-yet-implemented `api` skeleton") no longer holds
-  and each deferral needs re-justifying or removing.
+- The `deny.toml` advisory deferrals were re-justified 2026-07-24 now that
+  `api` and `cold-consumer` are implemented (they no longer rest on the old
+  "not-yet-implemented skeleton" reasoning). None are removable yet: `paste`
+  (RUSTSEC-2024-0436) is an unmaintained-only advisory with no patched release,
+  and the two `quick-xml` DoS advisories (RUSTSEC-2026-0194/0195) are fixed in
+  0.41 but we pin 0.39.4 transitively via `object_store` — and only ever parse
+  our own local MinIO's XML, never attacker input. Revisit on the next
+  `object_store` bump. See the comments in `deny.toml` for the full rationale.
 - Undecodable Kafka messages are logged and skipped in both consumers; they
   should be routed to a `.dlq` topic instead of dropped (marked `TODO` in
   `crates/cold-consumer/src/lib.rs` and `crates/hot-consumer/src/lib.rs`).

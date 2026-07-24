@@ -3,7 +3,7 @@
 
 COMPOSE := docker compose
 
-.PHONY: help infra-up infra-down infra-logs topics build test lint fmt \
+.PHONY: help infra-up infra-down infra-logs topics lake-reset build test lint fmt \
         test-ingestor run-ingestor backfill run-hot run-cold run-api \
         frontend-install frontend-dev \
         module-build module-publish module-republish module-generate module-generate-rust
@@ -26,6 +26,13 @@ topics: ## create market topics with explicit configs (idempotent)
 			--topic-config retention.ms=259200000 \
 			--topic-config cleanup.policy=delete || true; \
 	done
+
+lake-reset: ## empty the MinIO lake bucket (needed after a lake schema change)
+	$(COMPOSE) run --rm minio-init \
+		'mc alias set local http://minio:9000 minioadmin minioadmin && \
+		 mc rm --recursive --force local/market-lake/ ; \
+		 mc mb --ignore-existing local/market-lake && \
+		 echo "lake bucket market-lake emptied"'
 
 build: ## build the Rust workspace and install frontend deps
 	cargo build --workspace

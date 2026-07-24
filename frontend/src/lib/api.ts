@@ -3,8 +3,9 @@
 // Live state comes from SpacetimeDB subscriptions (see spacetime.ts); this
 // module is the *cold* half — history read back out of the lake over REST.
 //
-// Prices/quantities are exact decimal strings (the lake has no decimal column
-// type), so convert with Number() only for rendering, never for accounting.
+// Prices/quantities arrive as exact decimal strings: the lake stores them as
+// native Decimal128(38, 8), and the api casts that back to a string at the JSON
+// boundary. Convert with Number() only for rendering, never for accounting.
 
 const API_URL: string = import.meta.env.VITE_API_URL ?? 'http://localhost:8081';
 
