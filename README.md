@@ -428,14 +428,36 @@ yet. Some sharpen a lever already named above rather than adding a new one.
   still ride in the filename (`p{kp}-off-{min}-{max}.parquet`), preserving the
   deterministic, idempotent-on-replay naming. Covered by a writer→reader
   round-trip test in `crates/api/src/lib.rs`.
+  - **Measured 2026-07-24** (clean A/B: same static ~288k-message backlog drained
+    fully into each layout, byte-identical row counts per query, api with a warm
+    listing cache so this is scan time not `LIST` time, 15 samples each). Warm
+    median per request, old (Kafka-partition) → new (Hive):
+
+    | query (2 symbols) | old | new | speedup |
+    |---|---|---|---|
+    | `/klines?symbol=BTCUSDT&interval=1m` | 53ms | 42ms | 1.3× |
+    | `/klines?symbol=BTCUSDT&interval=1s` | 55ms | 34ms | 1.6× |
+    | `/klines?symbol=ETHUSDT&interval=5m` | 50ms | 33ms | 1.5× |
+    | `/trades?symbol=BTCUSDT` | 21ms | 12ms | 1.8× |
+    | `/book_tickers?symbol=BTCUSDT` | 97ms | 47ms | 2.1× |
+
+    The win tracks how much the filter prunes: `book_tickers` (highest-volume
+    topic, one of two symbols pruned away) gains most; klines gain less per query
+    because each single interval holds little data at this lake size. Absolute
+    times are tens of ms because the lake is small (~26 MiB / ~288k rows) — far
+    under the README's earlier ~1.1s figure, which was a much larger lake — so
+    treat these as the *shape* of the win (pruning helps, proportional to volume),
+    not its ceiling. Note the cost side: the new layout wrote **1,253 files vs 625**
+    for the same data (fragmentation across symbol/interval dirs), and pruning
+    still won despite 2× the files — which is exactly why compaction (next item)
+    is the natural follow-up: it would widen this gap rather than being a
+    prerequisite for it.
   - **Still open:** the api sort + `LIMIT` still materializes over whatever files
     survive pruning, and there is no **date** partition yet — that pairs with the
     deep-history/time-range work above (and book_tickers carries no timestamp to
     date-partition on, so it stays symbol-only). This is a larger lever than the
     api-side "latest per open_time" aggregation noted earlier; the pruning is the
-    first half, a named time window is the second. The latency win is not
-    re-measured yet — the mechanism is in place, the benchmark under a realistic
-    multi-symbol lake is pending.
+    first half, a named time window is the second.
   - **Breaking:** this changed the lake layout *and* the file schemas (symbol/
     interval are no longer stored columns), so old files fail to read alongside
     new ones. Reset the bucket (`make lake-reset`) and repopulate, same as the
